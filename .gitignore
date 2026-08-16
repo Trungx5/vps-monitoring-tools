@@ -1,0 +1,14 @@
+# Runtime data - contains real VPS IPs, alert emails, and scraped metrics
+metrics.db
+metrics.db-journal
+vps_monitor.log
+vps_monitor.log.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / tool config
+.claude/

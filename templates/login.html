@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VPS Monitor - Sign in</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #171a23;
+    --border: #262a36;
+    --text: #e6e8ee;
+    --muted: #8b91a3;
+    --accent: #5b8def;
+    --bad: #e0524e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    width: 320px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.subtitle { color: var(--muted); font-size: 12.5px; margin: 0 0 22px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 9px 10px;
+    font-size: 13.5px;
+  }
+  .field input:focus { outline: none; border-color: var(--accent); }
+  button {
+    width: 100%;
+    background: var(--accent);
+    border: none; color: #fff;
+    padding: 10px; border-radius: 6px;
+    font-size: 13.5px; font-weight: 600; cursor: pointer;
+    margin-top: 6px;
+  }
+  button:hover { opacity: 0.9; }
+  .error { color: var(--bad); font-size: 12.5px; margin-top: 12px; }
+</style>
+</head>
+<body>
+  <form class="card" method="POST">
+    <h1>VPS Monitor</h1>
+    <p class="subtitle">Sign in to view or manage monitored instances.</p>
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" autocomplete="username" required autofocus>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit">Sign in</button>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  </form>
+</body>
+</html>

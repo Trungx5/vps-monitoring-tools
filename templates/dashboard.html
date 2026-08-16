@@ -1,0 +1,1424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VPS Monitor - Custom Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #171a23;
+    --border: #262a36;
+    --text: #e6e8ee;
+    --muted: #8b91a3;
+    --accent: #5b8def;
+    --ok: #33c481;
+    --warn: #e0a72e;
+    --bad: #e0524e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  /* ---------------- Top bar ---------------- */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  .hamburger-btn {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 38px; height: 38px;
+    border-radius: 8px;
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .hamburger-btn:hover { border-color: var(--accent); }
+  .topbar-titles h1 { font-size: 18px; font-weight: 600; margin: 0; }
+  .topbar-titles .subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .topbar-instance-select {
+    margin-left: auto;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    max-width: 220px;
+    flex-shrink: 0;
+  }
+  .topbar-instance-select:focus { outline: none; border-color: var(--accent); }
+  .status-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--ok);
+    margin-right: 6px;
+  }
+
+  .content { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ---------------- Sidebar drawer ---------------- */
+  .overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 40;
+  }
+  .overlay.open { display: block; }
+  .sidebar {
+    position: fixed; top: 0; left: -300px; bottom: 0;
+    width: 280px;
+    background: var(--card);
+    border-right: 1px solid var(--border);
+    z-index: 50;
+    transition: left 0.2s ease;
+    display: flex;
+    flex-direction: column;
+  }
+  .sidebar.open { left: 0; }
+  .sidebar-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sidebar-header strong { font-size: 14px; }
+  .sidebar-close {
+    background: none; border: none; color: var(--muted);
+    font-size: 18px; cursor: pointer; line-height: 1;
+  }
+  .sidebar-close:hover { color: var(--text); }
+  .sidebar-nav { padding: 10px; display: flex; flex-direction: column; gap: 2px; }
+  .sidebar-nav button {
+    display: flex; align-items: center; gap: 10px;
+    background: none; border: none; color: var(--text);
+    text-align: left; padding: 10px 12px; border-radius: 8px;
+    font-size: 13.5px; cursor: pointer; width: 100%;
+  }
+  .sidebar-nav button:hover { background: rgba(255,255,255,0.05); }
+  .sidebar-nav button.active { background: var(--accent); color: #fff; }
+  .sidebar-nav .icon { font-size: 15px; width: 18px; text-align: center; }
+  .sidebar-footer {
+    margin-top: auto; padding: 14px 18px; font-size: 11px; color: var(--muted);
+    border-top: 1px solid var(--border);
+  }
+  .logout-btn {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    padding: 7px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+    width: 100%; margin-top: 10px;
+  }
+  .logout-btn:hover { border-color: var(--bad); color: var(--bad); }
+
+  /* ---------------- Stat / chart cards ---------------- */
+  .section-title { font-size: 15px; font-weight: 600; margin: 0 0 14px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .stat-card.warn {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 1px var(--warn) inset;
+  }
+  .stat-card.warn .stat-value { color: var(--warn); }
+  .stat-card.critical {
+    border-color: var(--bad);
+    box-shadow: 0 0 0 1px var(--bad) inset;
+  }
+  .stat-card.critical .stat-value { color: var(--bad); }
+  .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat-value { font-size: 30px; font-weight: 700; margin-top: 6px; }
+  .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .severity-pill {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+    padding: 2px 7px; border-radius: 999px; margin-left: 8px;
+    vertical-align: middle;
+  }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+  }
+  .chart-title { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+    gap: 16px;
+  }
+  canvas { max-height: 220px; }
+  .chart-range-bar {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 16px;
+  }
+  .chart-range-bar label { font-size: 12.5px; color: var(--muted); }
+  .chart-range-bar select {
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 7px 9px; font-size: 12.5px;
+  }
+  .chart-range-bar select:focus { outline: none; border-color: var(--accent); }
+  .empty-state {
+    color: var(--muted); font-size: 13.5px;
+    border: 1px dashed var(--border); border-radius: 10px;
+    padding: 32px; text-align: center;
+  }
+  .scrape-error-banner {
+    background: rgba(224,82,78,0.08);
+    border: 1px solid var(--bad);
+    color: var(--bad);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 13px;
+    margin-bottom: 16px;
+  }
+
+  /* ---------------- Forms / instance list (Instances & Alerts views) ---------------- */
+  .panel-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    max-width: 480px;
+    margin-bottom: 20px;
+  }
+  .panel-card h3 { font-size: 14px; margin: 0 0 14px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .field input, .field select {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 9px 10px;
+    font-size: 13.5px;
+  }
+  .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+  .btn {
+    background: var(--accent);
+    border: none; color: #fff;
+    padding: 9px 16px; border-radius: 6px;
+    font-size: 13.5px; font-weight: 600; cursor: pointer;
+  }
+  .btn:hover { opacity: 0.9; }
+  .btn-danger { background: var(--bad); }
+  .form-msg { font-size: 12.5px; margin-top: 10px; }
+  .form-msg.error { color: var(--bad); }
+  .form-msg.ok { color: var(--ok); }
+
+  .instance-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    cursor: pointer;
+  }
+  .instance-row:hover { border-color: var(--accent); }
+  .instance-row.selected { border-color: var(--accent); background: rgba(91,141,239,0.08); }
+  .instance-row .name { font-size: 13.5px; font-weight: 600; }
+  .instance-row .url { font-size: 11.5px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+  .status-line { font-size: 11px; margin-top: 6px; display: flex; align-items: center; }
+  .instance-row .del-btn {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; width: 26px; height: 26px; font-size: 13px; cursor: pointer; flex-shrink: 0;
+  }
+  .instance-row .del-btn:hover { border-color: var(--bad); color: var(--bad); }
+
+  .thresh-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
+  .thresh-table th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; padding-bottom: 6px; }
+  .thresh-table td { padding: 4px 6px 4px 0; vertical-align: middle; }
+  .thresh-table td:first-child { color: var(--text); white-space: nowrap; padding-right: 10px; }
+  .thresh-table input { width: 100%; }
+
+  .subs-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .subs-table th {
+    text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+    padding: 0 8px 8px 0; border-bottom: 1px solid var(--border);
+  }
+  .subs-table td {
+    padding: 9px 8px 9px 0; border-bottom: 1px solid var(--border); vertical-align: middle;
+  }
+  .subs-table tr:last-child td { border-bottom: none; }
+  .subs-table td:first-child { color: var(--muted); width: 28px; }
+  .subs-table .del-btn {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; width: 24px; height: 24px; font-size: 12px; cursor: pointer;
+  }
+  .subs-table .del-btn:hover { border-color: var(--bad); color: var(--bad); }
+
+  .health-row {
+    display: flex; gap: 12px; align-items: flex-start;
+    padding: 12px 0; border-bottom: 1px solid var(--border);
+  }
+  .health-row:last-child { border-bottom: none; }
+  .health-icon {
+    flex-shrink: 0; width: 26px; height: 26px; border-radius: 50%;
+    border: 1px solid currentColor;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; margin-top: 1px;
+  }
+  .health-label { font-size: 13.5px; font-weight: 600; }
+  .health-badge {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.03em; margin-left: 8px;
+  }
+  .health-desc { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+
+  .logs-filters { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .logs-filters select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 7px 9px; font-size: 12.5px;
+  }
+  .logs-list { max-height: 560px; overflow-y: auto; }
+  .log-row {
+    display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border);
+    align-items: flex-start; font-size: 12.5px;
+  }
+  .log-row:last-child { border-bottom: none; }
+  .log-time { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .log-level {
+    font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;
+    text-transform: uppercase; flex-shrink: 0; white-space: nowrap; margin-top: 1px;
+  }
+  .log-level.info { background: rgba(51,196,129,0.15); color: var(--ok); }
+  .log-level.warn { background: rgba(224,167,46,0.15); color: var(--warn); }
+  .log-level.error { background: rgba(224,82,78,0.15); color: var(--bad); }
+  .log-instance { color: var(--text); font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+  .log-message { color: var(--text); flex: 1; word-break: break-word; }
+</style>
+</head>
+<body>
+
+<div class="overlay" id="overlay"></div>
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <strong>Menu</strong>
+    <button class="sidebar-close" id="sidebarClose">&times;</button>
+  </div>
+  <div class="sidebar-nav">
+    <button data-view="dashboard" class="nav-btn active"><span class="icon">&#8962;</span> Main Menu</button>
+    <button data-view="instances" class="nav-btn"><span class="icon">&#43;</span> Add Monitoring Instance</button>
+    <button data-view="select" class="nav-btn"><span class="icon">&#9776;</span> Choose a VPS</button>
+    <button data-view="health" class="nav-btn"><span class="icon">&#10003;</span> Health Checks</button>
+    <button data-view="alerts" class="nav-btn"><span class="icon">&#9888;</span> Alerts</button>
+    <button data-view="logs" class="nav-btn"><span class="icon">&#128203;</span> Logs</button>
+  </div>
+  <div class="sidebar-footer">
+    Custom-built VPS monitor &middot; no Prometheus/Grafana
+    <form method="POST" action="/logout"><button type="submit" class="logout-btn">Log out</button></form>
+  </div>
+</div>
+
+<div class="topbar">
+  <button class="hamburger-btn" id="hamburgerBtn">&#9776;</button>
+  <div class="topbar-titles">
+    <h1><span class="status-dot" id="statusDot"></span>VPS Monitor<span id="topbarSeverity"></span></h1>
+    <div class="subtitle" id="topbarSubtitle">No instance selected</div>
+  </div>
+  <select id="topbarInstanceSelect" class="topbar-instance-select" title="Switch VPS"></select>
+</div>
+
+<div class="content">
+
+  <!-- ===================== Dashboard view ===================== -->
+  <div class="view active" id="view-dashboard">
+    <div id="dashboardEmpty" class="empty-state" style="display:none;">
+      No VPS instances yet. Open the menu and choose <strong>Add Monitoring Instance</strong> to get started.
+    </div>
+    <div id="dashboardBody" style="display:none;">
+      <div class="scrape-error-banner" id="scrapeErrorBanner" style="display:none;"></div>
+      <div class="grid">
+        <div class="stat-card" id="card-cpu">
+          <div class="stat-label">CPU</div>
+          <div class="stat-value" id="cpuValue">--</div>
+          <div class="stat-sub" id="loadValue">load1: --</div>
+        </div>
+        <div class="stat-card" id="card-mem">
+          <div class="stat-label">Memory</div>
+          <div class="stat-value" id="memValue">--</div>
+          <div class="stat-sub" id="memSub">--</div>
+        </div>
+        <div class="stat-card" id="card-disk">
+          <div class="stat-label">Disk</div>
+          <div class="stat-value" id="diskValue">--</div>
+          <div class="stat-sub" id="diskSub">--</div>
+        </div>
+        <div class="stat-card" id="card-bw">
+          <div class="stat-label">Bandwidth</div>
+          <div class="stat-value" id="bwValue">--</div>
+          <div class="stat-sub" id="bwSub">rx/s &middot; tx/s</div>
+        </div>
+        <div class="stat-card" id="card-diskio">
+          <div class="stat-label">Disk I/O</div>
+          <div class="stat-value" id="diskioValue">--</div>
+          <div class="stat-sub" id="diskioSub">read/s &middot; write/s</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Network (cumulative)</div>
+          <div class="stat-value" id="netValue">--</div>
+          <div class="stat-sub" id="netSub">rx / tx</div>
+        </div>
+      </div>
+
+      <div class="chart-range-bar">
+        <label for="rangeSelect">Charts range</label>
+        <select id="rangeSelect">
+          <option value="30">Last 30 seconds</option>
+          <option value="60">Last 1 minute</option>
+          <option value="120">Last 2 minutes</option>
+          <option value="300">Last 5 minutes</option>
+          <option value="600" selected>Last 10 minutes</option>
+          <option value="1800">Last 30 minutes</option>
+          <option value="3600">Last 1 hour</option>
+          <option value="7200">Last 2 hours</option>
+          <option value="21600">Last 6 hours</option>
+          <option value="43200">Last 12 hours</option>
+          <option value="86400">Last 24 hours</option>
+          <option value="172800">Last 2 days</option>
+          <option value="259200">Last 3 days</option>
+          <option value="604800">Last 7 days</option>
+        </select>
+      </div>
+
+      <div class="charts-grid">
+        <div class="chart-card">
+          <div class="chart-title">CPU %</div>
+          <canvas id="cpuChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Memory %</div>
+          <canvas id="memChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Disk %</div>
+          <canvas id="diskChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Bandwidth (bytes/sec)</div>
+          <canvas id="bwChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Disk I/O (bytes/sec)</div>
+          <canvas id="diskioChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Network Throughput (bytes total)</div>
+          <canvas id="netChart"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== Add / manage instances view ===================== -->
+  <div class="view" id="view-instances">
+    <h2 class="section-title" id="instFormTitle">Add Monitoring Instance</h2>
+    <div class="panel-card">
+      <h3 id="instFormSubtitle">New VPS</h3>
+      <form id="addInstanceForm">
+        <div class="field">
+          <label>Name</label>
+          <input type="text" id="newInstName" placeholder="e.g. Production API" required>
+        </div>
+        <div class="field">
+          <label>node_exporter URL</label>
+          <input type="text" id="newInstUrl" placeholder="http://1.2.3.4:9100/metrics" required>
+        </div>
+        <div class="field">
+          <label>Basic Auth username <span style="color:var(--muted);">(optional)</span></label>
+          <input type="text" id="newInstAuthUser" placeholder="leave blank if node_exporter has no auth" autocomplete="off">
+        </div>
+        <div class="field">
+          <label>Basic Auth password <span style="color:var(--muted);" id="newInstAuthPassHint">(optional)</span></label>
+          <input type="password" id="newInstAuthPass" placeholder="leave blank if node_exporter has no auth" autocomplete="new-password">
+        </div>
+        <button type="submit" class="btn" id="instFormSubmitBtn">Add Instance</button>
+        <button type="button" class="btn" id="instFormCancelBtn" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
+        <div class="form-msg" id="addInstMsg"></div>
+      </form>
+    </div>
+
+    <h2 class="section-title">Existing Instances</h2>
+    <div class="panel-card" id="manageInstList" style="max-width:560px;">
+      <div class="empty-state" id="manageInstEmpty">No instances yet.</div>
+    </div>
+  </div>
+
+  <!-- ===================== Select VPS view ===================== -->
+  <div class="view" id="view-select">
+    <h2 class="section-title">Choose a VPS</h2>
+    <div class="panel-card" id="selectInstList" style="max-width:560px;">
+      <div class="empty-state" id="selectInstEmpty">No instances yet.</div>
+    </div>
+  </div>
+
+  <!-- ===================== Health Checks view ===================== -->
+  <div class="view" id="view-health">
+    <h2 class="section-title" id="healthTargetLabel">Health Checks</h2>
+    <div class="panel-card" style="max-width:560px;">
+      <div id="healthEmpty" class="empty-state" style="display:none;">
+        Add and select a VPS instance first.
+      </div>
+      <div id="healthChecksList"></div>
+    </div>
+    <div class="stat-sub" style="max-width:560px;">
+      Pass/fail checks evaluated every scrape, separate from the Warn/Critical
+      thresholds. A check shows "Unknown" when there isn't enough history yet or
+      this node_exporter build doesn't expose that metric. If an alert email is
+      set (Alerts panel), you'll get one whenever any check flips from passing
+      to failing, or back.
+    </div>
+  </div>
+
+  <!-- ===================== Alerts view ===================== -->
+  <div class="view" id="view-alerts">
+    <div id="alertsNoInstances" class="empty-state" style="display:none; max-width:640px;">
+      No VPS instances yet. Open the menu and choose <strong>Add Monitoring Instance</strong> to get started.
+    </div>
+    <div id="alertsViewBody" style="display:none;">
+
+    <h2 class="section-title">Alert Recipients</h2>
+    <div class="panel-card" style="max-width:720px;">
+      <div id="subsEmpty" class="empty-state" style="display:none;">
+        No alert subscriptions yet. Add one below.
+      </div>
+      <table class="subs-table" id="subsTable" style="display:none;">
+        <thead><tr><th>#</th><th>Instance</th><th>Email</th><th>Alert</th><th></th></tr></thead>
+        <tbody id="subsTableBody"></tbody>
+      </table>
+
+      <button type="button" class="btn" id="addSubBtn" style="margin-top:14px;">+ Add Subscription</button>
+
+      <form id="addSubForm" style="display:none; margin-top:14px;">
+        <div class="field">
+          <label>Instance</label>
+          <select id="subInstance"></select>
+        </div>
+        <div class="field">
+          <label>Email</label>
+          <input type="email" id="subEmail" placeholder="you@example.com" required>
+        </div>
+        <div class="field">
+          <label>Alert</label>
+          <select id="subAlertType"></select>
+        </div>
+        <button type="submit" class="btn">Save</button>
+        <button type="button" class="btn" id="cancelSubBtn" style="background:var(--border); color:var(--text);">Cancel</button>
+        <div class="form-msg" id="subMsg"></div>
+      </form>
+    </div>
+
+    <h2 class="section-title">Thresholds</h2>
+    <div class="panel-card" style="max-width:560px;">
+      <div class="field">
+        <label>Instance</label>
+        <select id="threshInstance"></select>
+      </div>
+      <form id="alertsForm">
+        <table class="thresh-table">
+          <thead><tr><th>Metric</th><th>Warn</th><th>Critical</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>CPU (%)</td>
+              <td><input type="number" step="0.1" min="0" max="100" id="cpuWarn" placeholder="75"></td>
+              <td><input type="number" step="0.1" min="0" max="100" id="cpuCrit" placeholder="90"></td>
+            </tr>
+            <tr>
+              <td>Memory (%)</td>
+              <td><input type="number" step="0.1" min="0" max="100" id="memWarn" placeholder="75"></td>
+              <td><input type="number" step="0.1" min="0" max="100" id="memCrit" placeholder="90"></td>
+            </tr>
+            <tr>
+              <td>Disk (%)</td>
+              <td><input type="number" step="0.1" min="0" max="100" id="diskWarn" placeholder="75"></td>
+              <td><input type="number" step="0.1" min="0" max="100" id="diskCrit" placeholder="90"></td>
+            </tr>
+            <tr>
+              <td>Bandwidth (B/s)</td>
+              <td><input type="number" step="1" min="0" id="netWarn" placeholder="8000000"></td>
+              <td><input type="number" step="1" min="0" id="netCrit" placeholder="10000000"></td>
+            </tr>
+            <tr>
+              <td>Disk I/O (B/s)</td>
+              <td><input type="number" step="1" min="0" id="diskioWarn" placeholder="50000000"></td>
+              <td><input type="number" step="1" min="0" id="diskioCrit" placeholder="100000000"></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <button type="submit" class="btn" style="margin-top:16px;">Save Thresholds</button>
+        <div class="form-msg" id="alertsMsg"></div>
+      </form>
+      <div class="stat-sub" style="margin-top:14px;">
+        Leave a field blank to disable that tier. Crossing Warn or Critical highlights the matching
+        stat card amber/red, and emails anyone subscribed to that specific alert above &mdash; edge
+        triggered, so one email per change of state, not one per scrape.
+      </div>
+    </div>
+
+    </div>
+  </div>
+
+  <!-- ===================== Logs view ===================== -->
+  <div class="view" id="view-logs">
+    <h2 class="section-title">Logs</h2>
+    <div class="panel-card" style="max-width:900px;">
+      <div class="logs-filters">
+        <select id="logsInstanceFilter"><option value="">All instances</option></select>
+        <select id="logsLevelFilter">
+          <option value="">All levels</option>
+          <option value="error">Error</option>
+          <option value="warn">Warn</option>
+          <option value="info">Info</option>
+        </select>
+      </div>
+      <div id="logsEmpty" class="empty-state" style="display:none;">No log entries yet.</div>
+      <div class="logs-list" id="logsList"></div>
+    </div>
+    <div class="stat-sub" style="max-width:900px;">
+      A heartbeat check runs every 30 seconds per instance and logs its current
+      Good/Warn/Critical status here, alongside every scrape error and every
+      alert transition. Kept for 3 days. The full detail (including routine
+      successful scrapes) also goes to <code>vps_monitor.log</code> on disk.
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let instances = [];
+let currentInstanceId = localStorage.getItem('vpsmon_instance_id')
+  ? parseInt(localStorage.getItem('vpsmon_instance_id'), 10) : null;
+let thresholds = {
+  alert_email: null,
+  cpu_warn: null, cpu_crit: null, mem_warn: null, mem_crit: null,
+  disk_warn: null, disk_crit: null, net_warn: null, net_crit: null,
+  diskio_warn: null, diskio_crit: null,
+};
+
+// ---------------------------------------------------------------------------
+// Fetch wrapper - if the session has expired, the API returns 401 and we
+// bounce to the login page instead of leaving the dashboard silently broken.
+// ---------------------------------------------------------------------------
+async function apiFetch(url, opts) {
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('unauthenticated');
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Sidebar drawer + view switching
+// ---------------------------------------------------------------------------
+const sidebar = document.getElementById('sidebar');
+const overlay = document.getElementById('overlay');
+
+function openSidebar() { sidebar.classList.add('open'); overlay.classList.add('open'); }
+function closeSidebar() { sidebar.classList.remove('open'); overlay.classList.remove('open'); }
+
+document.getElementById('hamburgerBtn').addEventListener('click', openSidebar);
+document.getElementById('sidebarClose').addEventListener('click', closeSidebar);
+overlay.addEventListener('click', closeSidebar);
+
+function showView(name) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+  if (name === 'instances') renderManageList();
+  if (name === 'select') renderSelectList();
+  if (name === 'health') renderHealthChecks();
+  if (name === 'alerts') renderAlertsForm();
+  if (name === 'logs') refreshLogs();
+}
+
+document.querySelectorAll('.nav-btn').forEach(btn => {
+  btn.addEventListener('click', () => { showView(btn.dataset.view); closeSidebar(); });
+});
+
+// ---------------------------------------------------------------------------
+// Charts
+// ---------------------------------------------------------------------------
+const chartOpts = (label, color) => ({
+  type: 'line',
+  data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '22', tension: 0.3, pointRadius: 0, fill: true }] },
+  options: {
+    responsive: true,
+    animation: false,
+    scales: {
+      x: { ticks: { color: '#8b91a3', maxTicksLimit: 6 }, grid: { color: '#262a36' } },
+      y: { ticks: { color: '#8b91a3' }, grid: { color: '#262a36' }, beginAtZero: true }
+    },
+    plugins: { legend: { display: false } }
+  }
+});
+
+const cpuChart = new Chart(document.getElementById('cpuChart'), chartOpts('CPU %', '#5b8def'));
+const memChart = new Chart(document.getElementById('memChart'), chartOpts('Mem %', '#33c481'));
+const diskChart = new Chart(document.getElementById('diskChart'), chartOpts('Disk %', '#e0a72e'));
+
+const dualLineOpts = (l1, c1, l2, c2) => ({
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label: l1, data: [], borderColor: c1, pointRadius: 0, tension: 0.3 },
+    { label: l2, data: [], borderColor: c2, pointRadius: 0, tension: 0.3 }
+  ]},
+  options: {
+    responsive: true, animation: false,
+    scales: {
+      x: { ticks: { color: '#8b91a3', maxTicksLimit: 6 }, grid: { color: '#262a36' } },
+      y: { ticks: { color: '#8b91a3' }, grid: { color: '#262a36' } }
+    },
+    plugins: { legend: { labels: { color: '#e6e8ee' } } }
+  }
+});
+
+const bwChart = new Chart(document.getElementById('bwChart'), dualLineOpts('RX/s', '#5b8def', 'TX/s', '#e0524e'));
+const diskioChart = new Chart(document.getElementById('diskioChart'), dualLineOpts('Read/s', '#33c481', 'Write/s', '#e0a72e'));
+const netChart = new Chart(document.getElementById('netChart'), dualLineOpts('RX', '#5b8def', 'TX', '#e0524e'));
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+function fmtTime(iso) {
+  const d = new Date(iso + 'Z');
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function fmtChartLabel(iso, rangeSeconds) {
+  const d = new Date(iso + 'Z');
+  if (rangeSeconds >= 86400) {
+    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+  return fmtTime(iso);
+}
+function fmtBytes(bytes) {
+  if (bytes === null || bytes === undefined) return '--';
+  if (bytes < 1024) return bytes + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { bytes /= 1024; i++; } while (bytes >= 1024 && i < units.length - 1);
+  return bytes.toFixed(1) + ' ' + units[i];
+}
+function fmtBps(bytes) {
+  if (bytes === null || bytes === undefined) return '--';
+  return fmtBytes(bytes) + '/s';
+}
+function severityFor(value, warn, crit) {
+  if (value === null || value === undefined) return null;
+  if (crit !== null && crit !== undefined && value >= crit) return 'critical';
+  if (warn !== null && warn !== undefined && value >= warn) return 'warn';
+  return 'good';
+}
+function maxOrNull(a, b) {
+  if (a === null || a === undefined) return b ?? null;
+  if (b === null || b === undefined) return a;
+  return Math.max(a, b);
+}
+function setSeverityClass(cardId, sev) {
+  const el = document.getElementById(cardId);
+  el.classList.toggle('warn', sev === 'warn');
+  el.classList.toggle('critical', sev === 'critical');
+}
+function severityPillHtml(sev) {
+  if (!sev) return '';
+  const colors = { good: 'var(--ok)', warn: 'var(--warn)', critical: 'var(--bad)' };
+  const label = { good: 'GOOD', warn: 'WARN', critical: 'CRITICAL' }[sev];
+  const color = colors[sev];
+  return `<span class="severity-pill" style="background:${color}22;color:${color};border:1px solid ${color};">${label}</span>`;
+}
+function instanceSeverityPillHtml(inst) {
+  // Don't show a stale Good/Warn/Critical pill computed from old data while
+  // the current scrape is failing or hasn't happened yet - that reads as a
+  // confident answer we don't actually have right now.
+  if (!inst || inst.last_status === 'error' || inst.last_status === 'pending') return '';
+  return severityPillHtml(inst.severity && inst.severity.overall);
+}
+
+const HEALTH_LABELS = {
+  reachable: ['Host reachable', 'The dashboard successfully scraped node_exporter on the last cycle.'],
+  net_ifaces: ['Network interfaces up', 'All non-loopback network interfaces report as up.'],
+  fs_writable: ['Root filesystem writable', "The root filesystem isn't mounted read-only - a common sign of disk corruption."],
+  load: ['System load normal', 'The 1-minute load average is within a normal range for this many CPU cores.'],
+  swap: ['Swap not exhausted', "Swap usage is below 90%, so the system isn't thrashing."],
+  reboot: ['No unexpected reboot', 'Uptime is continuous since the last check - no unplanned restart detected.'],
+  traffic: ['No traffic anomaly', 'Current bandwidth is not a large spike versus its recent baseline - a rough signal for things like a DDoS or scraping attack.'],
+};
+
+function healthFailingCount(inst) {
+  if (!inst || !inst.health) return 0;
+  return Object.values(inst.health).filter(v => v === false).length;
+}
+
+function healthSummaryHtml(inst) {
+  const failing = healthFailingCount(inst);
+  if (failing === 0) return '';
+  return `<div class="status-line" style="color:var(--bad);"><span class="status-dot" style="background:var(--bad);"></span>${failing} health check${failing > 1 ? 's' : ''} failing</div>`;
+}
+
+function healthRowHtml(key, val) {
+  const [label, desc] = HEALTH_LABELS[key];
+  let icon, color, text;
+  if (val === true) { icon = '&#10003;'; color = 'var(--ok)'; text = 'OK'; }
+  else if (val === false) { icon = '&#10007;'; color = 'var(--bad)'; text = 'FAILING'; }
+  else { icon = '?'; color = 'var(--muted)'; text = 'UNKNOWN'; }
+  return `
+    <div class="health-row">
+      <div class="health-icon" style="color:${color};">${icon}</div>
+      <div>
+        <div class="health-label">${label}<span class="health-badge" style="color:${color};">${text}</span></div>
+        <div class="health-desc">${desc}</div>
+      </div>
+    </div>`;
+}
+
+function renderHealthChecks() {
+  const inst = instances.find(i => i.id === currentInstanceId);
+  document.getElementById('healthEmpty').style.display = inst ? 'none' : 'block';
+  document.getElementById('healthTargetLabel').textContent = inst ? `Health Checks for ${inst.name}` : 'Health Checks';
+  const list = document.getElementById('healthChecksList');
+  if (!inst) { list.innerHTML = ''; return; }
+  const health = (inst.health) || {};
+  list.innerHTML = Object.keys(HEALTH_LABELS).map(key => healthRowHtml(key, health[key])).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Instances: load / select / add / delete
+// ---------------------------------------------------------------------------
+async function loadInstances() {
+  const res = await apiFetch('/api/instances');
+  instances = await res.json();
+
+  if (!instances.find(i => i.id === currentInstanceId)) {
+    currentInstanceId = instances.length ? instances[0].id : null;
+  }
+  if (currentInstanceId) localStorage.setItem('vpsmon_instance_id', currentInstanceId);
+
+  updateTopbar();
+  document.getElementById('dashboardEmpty').style.display = instances.length ? 'none' : 'block';
+  document.getElementById('dashboardBody').style.display = instances.length ? 'block' : 'none';
+
+  const activeView = document.querySelector('.view.active').id;
+  if (activeView === 'view-instances') renderManageList();
+  if (activeView === 'view-select') renderSelectList();
+  if (activeView === 'view-health') renderHealthChecks();
+  if (activeView === 'view-logs') refreshLogs();
+}
+
+function updateTopbar() {
+  const inst = instances.find(i => i.id === currentInstanceId);
+  document.getElementById('topbarSubtitle').textContent = inst
+    ? `${inst.name} · ${inst.target_url} · refreshes every 10s`
+    : 'No instance selected';
+  document.getElementById('topbarSeverity').innerHTML =
+    inst ? instanceSeverityPillHtml(inst) : '';
+
+  const switcher = document.getElementById('topbarInstanceSelect');
+  if (!instances.length) {
+    switcher.innerHTML = '<option value="">No instances</option>';
+    switcher.disabled = true;
+  } else {
+    switcher.disabled = false;
+    switcher.innerHTML = instances.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+    if (currentInstanceId) switcher.value = currentInstanceId;
+  }
+}
+
+document.getElementById('topbarInstanceSelect').addEventListener('change', (e) => {
+  const id = parseInt(e.target.value, 10);
+  if (id) selectInstance(id);
+});
+
+function selectInstance(id) {
+  currentInstanceId = id;
+  localStorage.setItem('vpsmon_instance_id', id);
+  updateTopbar();
+  resetCharts();
+  loadThresholds();
+  refreshLatest();
+  refreshHistory();
+  showView('dashboard');
+  closeSidebar();
+}
+
+function resetCharts() {
+  [cpuChart, memChart, diskChart, bwChart, diskioChart, netChart].forEach(c => {
+    c.data.labels = [];
+    c.data.datasets.forEach(ds => ds.data = []);
+    c.update();
+  });
+}
+
+function statusLineHtml(inst) {
+  const colors = { ok: 'var(--ok)', pending: 'var(--warn)', error: 'var(--bad)' };
+  const labels = {
+    ok: 'OK',
+    pending: 'Waiting for first scrape...',
+    error: 'Scrape failed: ' + (inst.last_error || 'unknown error'),
+  };
+  const status = inst.last_status || null;
+  const color = status ? colors[status] : 'var(--muted)';
+  const label = status ? labels[status] : 'Not checked yet';
+  return `<div class="status-line" style="color:${color};"><span class="status-dot" style="background:${color};"></span>${escapeHtml(label)}</div>`;
+}
+
+function instanceRowHtml(inst, selected, withDelete, withEdit) {
+  return `
+    <div class="instance-row ${selected ? 'selected' : ''}" data-id="${inst.id}">
+      <div>
+        <div class="name">${escapeHtml(inst.name)}${inst.has_auth ? ' <span title="Basic Auth configured">&#128274;</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
+        <div class="url">${escapeHtml(inst.target_url)}</div>
+        ${statusLineHtml(inst)}
+        ${healthSummaryHtml(inst)}
+      </div>
+      <div style="display:flex; gap:6px; flex-shrink:0;">
+        ${withEdit ? `<button class="del-btn" data-edit="${inst.id}" title="Edit">&#9998;</button>` : ''}
+        ${withDelete ? `<button class="del-btn" data-del="${inst.id}" title="Delete">&times;</button>` : ''}
+      </div>
+    </div>`;
+}
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function deleteInstance(id) {
+  const inst = instances.find(i => i.id === id);
+  if (!confirm(`Delete "${inst ? inst.name : id}" and all of its history? This can't be undone.`)) return;
+  await apiFetch('/api/instances/' + id, { method: 'DELETE' });
+  await loadInstances();
+  renderManageList();
+  renderSelectList();
+  if (currentInstanceId) { resetCharts(); refreshLatest(); refreshHistory(); loadThresholds(); }
+}
+
+function wireInstanceRows(box) {
+  box.querySelectorAll('.instance-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.del-btn')) return;
+      selectInstance(parseInt(row.dataset.id, 10));
+    });
+  });
+  box.querySelectorAll('[data-del]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteInstance(parseInt(btn.dataset.del, 10));
+    });
+  });
+  box.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const inst = instances.find(i => i.id === parseInt(btn.dataset.edit, 10));
+      if (inst) startEditInstance(inst);
+    });
+  });
+}
+
+function renderSelectList() {
+  const box = document.getElementById('selectInstList');
+  document.getElementById('selectInstEmpty').style.display = instances.length ? 'none' : 'block';
+  box.querySelectorAll('.instance-row').forEach(el => el.remove());
+  instances.forEach(inst => {
+    box.insertAdjacentHTML('beforeend', instanceRowHtml(inst, inst.id === currentInstanceId, true));
+  });
+  wireInstanceRows(box);
+}
+
+function renderManageList() {
+  const box = document.getElementById('manageInstList');
+  document.getElementById('manageInstEmpty').style.display = instances.length ? 'none' : 'block';
+  box.querySelectorAll('.instance-row').forEach(el => el.remove());
+  instances.forEach(inst => {
+    box.insertAdjacentHTML('beforeend', instanceRowHtml(inst, inst.id === currentInstanceId, true, true));
+  });
+  wireInstanceRows(box);
+}
+
+let editingInstanceId = null;
+
+function startEditInstance(inst) {
+  editingInstanceId = inst.id;
+  document.getElementById('instFormTitle').textContent = 'Edit Monitoring Instance';
+  document.getElementById('instFormSubtitle').textContent = `Editing "${inst.name}"`;
+  document.getElementById('newInstName').value = inst.name;
+  document.getElementById('newInstUrl').value = inst.target_url;
+  document.getElementById('newInstAuthUser').value = inst.auth_username || '';
+  document.getElementById('newInstAuthPass').value = '';
+  document.getElementById('newInstAuthPassHint').textContent =
+    inst.has_auth ? '(leave blank to keep the current password)' : '(optional)';
+  document.getElementById('instFormSubmitBtn').textContent = 'Save Changes';
+  document.getElementById('instFormCancelBtn').style.display = 'inline-block';
+  document.getElementById('addInstMsg').textContent = '';
+  showView('instances');
+}
+
+function cancelEditInstance() {
+  editingInstanceId = null;
+  document.getElementById('instFormTitle').textContent = 'Add Monitoring Instance';
+  document.getElementById('instFormSubtitle').textContent = 'New VPS';
+  document.getElementById('addInstanceForm').reset();
+  document.getElementById('newInstAuthPassHint').textContent = '(optional)';
+  document.getElementById('instFormSubmitBtn').textContent = 'Add Instance';
+  document.getElementById('instFormCancelBtn').style.display = 'none';
+}
+
+document.getElementById('instFormCancelBtn').addEventListener('click', cancelEditInstance);
+
+document.getElementById('addInstanceForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('addInstMsg');
+  msg.textContent = '';
+  msg.className = 'form-msg';
+  const body = {
+    name: document.getElementById('newInstName').value.trim(),
+    target_url: document.getElementById('newInstUrl').value.trim(),
+    auth_username: document.getElementById('newInstAuthUser').value.trim(),
+    auth_password: document.getElementById('newInstAuthPass').value,
+  };
+
+  const res = editingInstanceId
+    ? await apiFetch('/api/instances/' + editingInstanceId, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      })
+    : await apiFetch('/api/instances', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error || 'Failed to save instance';
+    msg.className = 'form-msg error';
+    return;
+  }
+
+  const wasEditing = editingInstanceId;
+  if (wasEditing) {
+    msg.textContent = 'Saved.';
+    msg.className = 'form-msg ok';
+    cancelEditInstance();
+    await loadInstances();
+    renderManageList();
+    if (currentInstanceId) { refreshLatest(); }
+  } else {
+    msg.textContent = 'Added. Metrics will appear after the first two scrapes (~20s).';
+    msg.className = 'form-msg ok';
+    document.getElementById('addInstanceForm').reset();
+    await loadInstances();
+    selectInstance(data.id);
+    renderManageList();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Alerts / thresholds
+// ---------------------------------------------------------------------------
+async function loadThresholds() {
+  if (!currentInstanceId) return;
+  const res = await apiFetch('/api/thresholds?instance_id=' + currentInstanceId);
+  thresholds = await res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Alerts page: one global list across every instance - "database" style.
+// Each subscription row picks its own Instance, not whichever VPS happens to
+// be selected elsewhere in the app. Same for which instance's Warn/Critical
+// thresholds you're currently editing.
+// ---------------------------------------------------------------------------
+const ALERT_TYPES = [
+  ['cpu', 'CPU usage'],
+  ['mem', 'Memory usage'],
+  ['disk', 'Disk usage'],
+  ['net', 'Network bandwidth high'],
+  ['diskio', 'Disk I/O high'],
+  ['reachable', 'System down / unreachable'],
+  ['net_ifaces', 'Network interface down'],
+  ['fs_writable', 'Filesystem read-only'],
+  ['load', 'System overloaded'],
+  ['swap', 'Swap exhausted'],
+  ['reboot', 'Unexpected reboot'],
+  ['traffic', 'Traffic anomaly (possible attack)'],
+];
+const ALERT_TYPE_LABEL = Object.fromEntries(ALERT_TYPES);
+document.getElementById('subAlertType').innerHTML =
+  ALERT_TYPES.map(([k, label]) => `<option value="${k}">${label}</option>`).join('');
+
+let subscriptions = [];
+let alertsThresholds = {};
+let threshInstanceId = null;
+
+function populateAlertsInstanceSelects() {
+  const opts = instances.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+  document.getElementById('subInstance').innerHTML = opts;
+  document.getElementById('threshInstance').innerHTML = opts;
+}
+
+function instanceNameFor(id) {
+  const inst = instances.find(i => i.id === id);
+  return inst ? inst.name : `#${id}`;
+}
+
+async function loadSubscriptions() {
+  const res = await apiFetch('/api/subscriptions');
+  subscriptions = await res.json();
+}
+
+async function refreshSubscriptions() {
+  await loadSubscriptions();
+  renderSubscriptions();
+}
+
+function renderSubscriptions() {
+  const empty = document.getElementById('subsEmpty');
+  const table = document.getElementById('subsTable');
+  const body = document.getElementById('subsTableBody');
+
+  if (!subscriptions.length) {
+    empty.style.display = 'block';
+    table.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  table.style.display = 'table';
+  body.innerHTML = subscriptions.map((s, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td>${escapeHtml(s.instance_name || instanceNameFor(s.instance_id))}</td>
+      <td>${escapeHtml(s.email)}</td>
+      <td>${escapeHtml(ALERT_TYPE_LABEL[s.alert_type] || s.alert_type)}</td>
+      <td><button type="button" class="del-btn" data-sub-id="${s.id}" title="Remove">&times;</button></td>
+    </tr>`).join('');
+  body.querySelectorAll('.del-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      await apiFetch('/api/subscriptions/' + btn.dataset.subId, { method: 'DELETE' });
+      await refreshSubscriptions();
+    });
+  });
+}
+
+document.getElementById('addSubBtn').addEventListener('click', () => {
+  document.getElementById('subInstance').value = threshInstanceId ?? (instances[0] && instances[0].id);
+  document.getElementById('addSubForm').style.display = 'block';
+  document.getElementById('addSubBtn').style.display = 'none';
+});
+document.getElementById('cancelSubBtn').addEventListener('click', () => {
+  document.getElementById('addSubForm').reset();
+  document.getElementById('addSubForm').style.display = 'none';
+  document.getElementById('addSubBtn').style.display = 'inline-block';
+  document.getElementById('subMsg').textContent = '';
+});
+document.getElementById('addSubForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('subMsg');
+  msg.textContent = '';
+  msg.className = 'form-msg';
+  const body = {
+    instance_id: parseInt(document.getElementById('subInstance').value, 10),
+    email: document.getElementById('subEmail').value.trim(),
+    alert_type: document.getElementById('subAlertType').value,
+  };
+  const res = await apiFetch('/api/subscriptions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    document.getElementById('addSubForm').reset();
+    document.getElementById('addSubForm').style.display = 'none';
+    document.getElementById('addSubBtn').style.display = 'inline-block';
+    await refreshSubscriptions();
+  } else {
+    msg.textContent = data.error || 'Failed to add subscription.';
+    msg.className = 'form-msg error';
+  }
+});
+
+async function loadAlertsThresholds() {
+  const res = await apiFetch('/api/thresholds?instance_id=' + threshInstanceId);
+  alertsThresholds = await res.json();
+}
+
+function renderThresholdsForm() {
+  document.getElementById('cpuWarn').value = alertsThresholds.cpu_warn ?? '';
+  document.getElementById('cpuCrit').value = alertsThresholds.cpu_crit ?? '';
+  document.getElementById('memWarn').value = alertsThresholds.mem_warn ?? '';
+  document.getElementById('memCrit').value = alertsThresholds.mem_crit ?? '';
+  document.getElementById('diskWarn').value = alertsThresholds.disk_warn ?? '';
+  document.getElementById('diskCrit').value = alertsThresholds.disk_crit ?? '';
+  document.getElementById('netWarn').value = alertsThresholds.net_warn ?? '';
+  document.getElementById('netCrit').value = alertsThresholds.net_crit ?? '';
+  document.getElementById('diskioWarn').value = alertsThresholds.diskio_warn ?? '';
+  document.getElementById('diskioCrit').value = alertsThresholds.diskio_crit ?? '';
+}
+
+async function renderAlertsForm() {
+  document.getElementById('alertsNoInstances').style.display = instances.length ? 'none' : 'block';
+  document.getElementById('alertsViewBody').style.display = instances.length ? 'block' : 'none';
+  if (!instances.length) return;
+
+  populateAlertsInstanceSelects();
+  if (threshInstanceId === null || !instances.find(i => i.id === threshInstanceId)) {
+    threshInstanceId = instances.find(i => i.id === currentInstanceId) ? currentInstanceId : instances[0].id;
+  }
+  document.getElementById('threshInstance').value = threshInstanceId;
+
+  await refreshSubscriptions();
+  await loadAlertsThresholds();
+  renderThresholdsForm();
+}
+
+document.getElementById('threshInstance').addEventListener('change', async (e) => {
+  threshInstanceId = parseInt(e.target.value, 10);
+  await loadAlertsThresholds();
+  renderThresholdsForm();
+});
+
+document.getElementById('alertsForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('alertsMsg');
+  const body = {
+    instance_id: threshInstanceId,
+    cpu_warn: document.getElementById('cpuWarn').value,
+    cpu_crit: document.getElementById('cpuCrit').value,
+    mem_warn: document.getElementById('memWarn').value,
+    mem_crit: document.getElementById('memCrit').value,
+    disk_warn: document.getElementById('diskWarn').value,
+    disk_crit: document.getElementById('diskCrit').value,
+    net_warn: document.getElementById('netWarn').value,
+    net_crit: document.getElementById('netCrit').value,
+    diskio_warn: document.getElementById('diskioWarn').value,
+    diskio_crit: document.getElementById('diskioCrit').value,
+  };
+  const res = await apiFetch('/api/thresholds', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    msg.textContent = 'Saved.';
+    msg.className = 'form-msg ok';
+    await loadAlertsThresholds();
+    renderThresholdsForm();
+    if (threshInstanceId === currentInstanceId) {
+      await loadThresholds();
+      refreshLatest();
+    }
+    await loadInstances();
+  } else {
+    msg.textContent = data.error || 'Failed to save thresholds.';
+    msg.className = 'form-msg error';
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
+function populateLogsInstanceFilter() {
+  const sel = document.getElementById('logsInstanceFilter');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">All instances</option>' +
+    instances.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+  sel.value = current;
+}
+
+function fmtLogTime(iso) {
+  const d = new Date(iso + 'Z');
+  return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+async function refreshLogs() {
+  populateLogsInstanceFilter();
+  const instFilter = document.getElementById('logsInstanceFilter').value;
+  const levelFilter = document.getElementById('logsLevelFilter').value;
+  let url = '/api/logs?limit=200';
+  if (instFilter) url += '&instance_id=' + instFilter;
+  if (levelFilter) url += '&level=' + levelFilter;
+  const res = await apiFetch(url);
+  const logs = await res.json();
+  renderLogs(logs);
+}
+
+function renderLogs(logs) {
+  const empty = document.getElementById('logsEmpty');
+  const list = document.getElementById('logsList');
+  if (!logs.length) {
+    empty.style.display = 'block';
+    list.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+  list.innerHTML = logs.map(l => `
+    <div class="log-row">
+      <div class="log-time">${fmtLogTime(l.timestamp)}</div>
+      <div class="log-level ${l.level}">${l.level}</div>
+      <div class="log-instance">${escapeHtml(l.instance_name || '-')}</div>
+      <div class="log-message">${escapeHtml(l.message)}</div>
+    </div>`).join('');
+}
+
+document.getElementById('logsInstanceFilter').addEventListener('change', refreshLogs);
+document.getElementById('logsLevelFilter').addEventListener('change', refreshLogs);
+
+// ---------------------------------------------------------------------------
+// Metrics polling
+// ---------------------------------------------------------------------------
+function blankStats(errorMessage) {
+  document.getElementById('statusDot').style.background = '#e0524e';
+
+  document.getElementById('cpuValue').textContent = '--';
+  document.getElementById('loadValue').textContent = 'load1: --';
+  document.getElementById('memValue').textContent = '--';
+  document.getElementById('memSub').textContent = '--';
+  document.getElementById('diskValue').textContent = '--';
+  document.getElementById('diskSub').textContent = '--';
+  document.getElementById('bwValue').textContent = '--';
+  document.getElementById('bwSub').textContent = 'rx/s · tx/s';
+  document.getElementById('diskioValue').textContent = '--';
+  document.getElementById('diskioSub').textContent = 'read/s · write/s';
+  document.getElementById('netValue').textContent = '--';
+  document.getElementById('netSub').textContent = 'rx / tx';
+  ['card-cpu', 'card-mem', 'card-disk', 'card-bw', 'card-diskio'].forEach(id => setSeverityClass(id, null));
+
+  const banner = document.getElementById('scrapeErrorBanner');
+  if (errorMessage) {
+    banner.textContent = '⚠ ' + errorMessage;
+    banner.style.display = 'block';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
+async function refreshLatest() {
+  if (!currentInstanceId) return;
+  const inst = instances.find(i => i.id === currentInstanceId);
+
+  if (inst && inst.last_status === 'error') {
+    blankStats(`Scrape failing for ${inst.name}: ${inst.last_error || 'unknown error'}`);
+    return;
+  }
+  if (inst && inst.last_status === 'pending') {
+    blankStats(`Waiting for the first scrape of ${inst.name}...`);
+    return;
+  }
+
+  try {
+    const res = await apiFetch('/api/metrics/latest?instance_id=' + currentInstanceId);
+    const m = await res.json();
+    if (!m) { blankStats(); return; }
+    document.getElementById('statusDot').style.background = '#33c481';
+    document.getElementById('scrapeErrorBanner').style.display = 'none';
+
+    document.getElementById('cpuValue').textContent = m.cpu_percent + '%';
+    document.getElementById('loadValue').textContent = 'load1: ' + m.load1;
+    setSeverityClass('card-cpu', severityFor(m.cpu_percent, thresholds.cpu_warn, thresholds.cpu_crit));
+
+    document.getElementById('memValue').textContent = m.mem_percent + '%';
+    document.getElementById('memSub').textContent = m.mem_used_mb + ' / ' + m.mem_total_mb + ' MB';
+    setSeverityClass('card-mem', severityFor(m.mem_percent, thresholds.mem_warn, thresholds.mem_crit));
+
+    document.getElementById('diskValue').textContent = m.disk_percent + '%';
+    document.getElementById('diskSub').textContent = m.disk_used_gb + ' / ' + m.disk_total_gb + ' GB';
+    setSeverityClass('card-disk', severityFor(m.disk_percent, thresholds.disk_warn, thresholds.disk_crit));
+
+    document.getElementById('bwValue').textContent = fmtBps(m.net_rx_bps) + ' ↓ / ' + fmtBps(m.net_tx_bps) + ' ↑';
+    document.getElementById('bwSub').textContent = fmtBps(m.net_rx_bps) + ' rx/s · ' + fmtBps(m.net_tx_bps) + ' tx/s';
+    setSeverityClass('card-bw', severityFor(maxOrNull(m.net_rx_bps, m.net_tx_bps), thresholds.net_warn, thresholds.net_crit));
+
+    document.getElementById('diskioValue').textContent = fmtBps(m.disk_read_bps) + ' R / ' + fmtBps(m.disk_write_bps) + ' W';
+    document.getElementById('diskioSub').textContent = fmtBps(m.disk_read_bps) + ' read/s · ' + fmtBps(m.disk_write_bps) + ' write/s';
+    setSeverityClass('card-diskio', severityFor(maxOrNull(m.disk_read_bps, m.disk_write_bps), thresholds.diskio_warn, thresholds.diskio_crit));
+
+    document.getElementById('netValue').textContent = fmtBytes(m.net_rx_bytes + m.net_tx_bytes);
+    document.getElementById('netSub').textContent = fmtBytes(m.net_rx_bytes) + ' rx / ' + fmtBytes(m.net_tx_bytes) + ' tx';
+  } catch (e) {
+    blankStats('Could not reach the monitoring server.');
+  }
+}
+
+let chartRangeSeconds = parseInt(localStorage.getItem('vpsmon_range_seconds') || '600', 10);
+
+async function refreshHistory() {
+  if (!currentInstanceId) return;
+  try {
+    const res = await apiFetch('/api/metrics/history?instance_id=' + currentInstanceId +
+      '&range_seconds=' + chartRangeSeconds);
+    const rows = await res.json();
+    const labels = rows.map(r => fmtChartLabel(r.timestamp, chartRangeSeconds));
+
+    cpuChart.data.labels = labels;
+    cpuChart.data.datasets[0].data = rows.map(r => r.cpu_percent);
+    cpuChart.update();
+
+    memChart.data.labels = labels;
+    memChart.data.datasets[0].data = rows.map(r => r.mem_percent);
+    memChart.update();
+
+    diskChart.data.labels = labels;
+    diskChart.data.datasets[0].data = rows.map(r => r.disk_percent);
+    diskChart.update();
+
+    bwChart.data.labels = labels;
+    bwChart.data.datasets[0].data = rows.map(r => r.net_rx_bps);
+    bwChart.data.datasets[1].data = rows.map(r => r.net_tx_bps);
+    bwChart.update();
+
+    diskioChart.data.labels = labels;
+    diskioChart.data.datasets[0].data = rows.map(r => r.disk_read_bps);
+    diskioChart.data.datasets[1].data = rows.map(r => r.disk_write_bps);
+    diskioChart.update();
+
+    netChart.data.labels = labels;
+    netChart.data.datasets[0].data = rows.map(r => r.net_rx_bytes);
+    netChart.data.datasets[1].data = rows.map(r => r.net_tx_bytes);
+    netChart.update();
+  } catch (e) { /* ignore */ }
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+document.getElementById('rangeSelect').value = chartRangeSeconds;
+document.getElementById('rangeSelect').addEventListener('change', (e) => {
+  chartRangeSeconds = parseInt(e.target.value, 10);
+  localStorage.setItem('vpsmon_range_seconds', chartRangeSeconds);
+  refreshHistory();
+});
+
+(async function init() {
+  await loadInstances();
+  await loadThresholds();
+  refreshLatest();
+  refreshHistory();
+  setInterval(refreshLatest, 5000);
+  setInterval(refreshHistory, 10000);
+  setInterval(loadInstances, 10000);
+})();
+</script>
+
+</body>
+</html>
