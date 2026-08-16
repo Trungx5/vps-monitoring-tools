@@ -12,3 +12,6 @@ venv/
 
 # Editor / tool config
 .claude/
+
+# Kept locally only, not pushed
+README.md
