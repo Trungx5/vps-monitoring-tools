@@ -108,7 +108,6 @@
   }
   .sidebar-nav button:hover { background: rgba(255,255,255,0.05); }
   .sidebar-nav button.active { background: var(--accent); color: #fff; }
-  .sidebar-nav .icon { font-size: 15px; width: 18px; text-align: center; }
   .sidebar-footer {
     margin-top: auto; padding: 14px 18px; font-size: 11px; color: var(--muted);
     border-top: 1px solid var(--border);
@@ -152,6 +151,12 @@
     font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
     padding: 2px 7px; border-radius: 999px; margin-left: 8px;
     vertical-align: middle;
+  }
+  .auth-badge {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+    padding: 2px 7px; border-radius: 999px; margin-left: 8px;
+    vertical-align: middle;
+    background: rgba(139,145,163,0.15); color: var(--muted); border: 1px solid var(--border);
   }
   .chart-card {
     background: var(--card);
@@ -245,6 +250,8 @@
     border-radius: 6px; width: 26px; height: 26px; font-size: 13px; cursor: pointer; flex-shrink: 0;
   }
   .instance-row .del-btn:hover { border-color: var(--bad); color: var(--bad); }
+  .instance-row .edit-btn { width: auto; padding: 0 10px; font-size: 11.5px; }
+  .instance-row .edit-btn:hover { border-color: var(--accent); color: var(--accent); }
 
   .thresh-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
   .thresh-table th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11px; padding-bottom: 6px; }
@@ -317,12 +324,12 @@
     <button class="sidebar-close" id="sidebarClose">&times;</button>
   </div>
   <div class="sidebar-nav">
-    <button data-view="dashboard" class="nav-btn active"><span class="icon">&#8962;</span> Main Menu</button>
-    <button data-view="instances" class="nav-btn"><span class="icon">&#43;</span> Add Monitoring Instance</button>
-    <button data-view="select" class="nav-btn"><span class="icon">&#9776;</span> Choose a VPS</button>
-    <button data-view="health" class="nav-btn"><span class="icon">&#10003;</span> Health Checks</button>
-    <button data-view="alerts" class="nav-btn"><span class="icon">&#9888;</span> Alerts</button>
-    <button data-view="logs" class="nav-btn"><span class="icon">&#128203;</span> Logs</button>
+    <button data-view="dashboard" class="nav-btn active">Main Menu</button>
+    <button data-view="instances" class="nav-btn">Add Monitoring Instance</button>
+    <button data-view="select" class="nav-btn">Choose a VPS</button>
+    <button data-view="health" class="nav-btn">Health Checks</button>
+    <button data-view="alerts" class="nav-btn">Alerts</button>
+    <button data-view="logs" class="nav-btn">Logs</button>
   </div>
   <div class="sidebar-footer">
     Custom-built VPS monitor &middot; no Prometheus/Grafana
@@ -782,8 +789,8 @@ function healthSummaryHtml(inst) {
 function healthRowHtml(key, val) {
   const [label, desc] = HEALTH_LABELS[key];
   let icon, color, text;
-  if (val === true) { icon = '&#10003;'; color = 'var(--ok)'; text = 'OK'; }
-  else if (val === false) { icon = '&#10007;'; color = 'var(--bad)'; text = 'FAILING'; }
+  if (val === true) { icon = 'OK'; color = 'var(--ok)'; text = 'OK'; }
+  else if (val === false) { icon = 'X'; color = 'var(--bad)'; text = 'FAILING'; }
   else { icon = '?'; color = 'var(--muted)'; text = 'UNKNOWN'; }
   return `
     <div class="health-row">
@@ -889,13 +896,13 @@ function instanceRowHtml(inst, selected, withDelete, withEdit) {
   return `
     <div class="instance-row ${selected ? 'selected' : ''}" data-id="${inst.id}">
       <div>
-        <div class="name">${escapeHtml(inst.name)}${inst.has_auth ? ' <span title="Basic Auth configured">&#128274;</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
+        <div class="name">${escapeHtml(inst.name)}${inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
         <div class="url">${escapeHtml(inst.target_url)}</div>
         ${statusLineHtml(inst)}
         ${healthSummaryHtml(inst)}
       </div>
       <div style="display:flex; gap:6px; flex-shrink:0;">
-        ${withEdit ? `<button class="del-btn" data-edit="${inst.id}" title="Edit">&#9998;</button>` : ''}
+        ${withEdit ? `<button class="del-btn edit-btn" data-edit="${inst.id}" title="Edit">Edit</button>` : ''}
         ${withDelete ? `<button class="del-btn" data-del="${inst.id}" title="Delete">&times;</button>` : ''}
       </div>
     </div>`;
@@ -1306,7 +1313,7 @@ function blankStats(errorMessage) {
 
   const banner = document.getElementById('scrapeErrorBanner');
   if (errorMessage) {
-    banner.textContent = '⚠ ' + errorMessage;
+    banner.textContent = errorMessage;
     banner.style.display = 'block';
   } else {
     banner.style.display = 'none';
