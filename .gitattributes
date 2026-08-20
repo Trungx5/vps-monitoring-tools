@@ -1,0 +1,8 @@
+# These are executed on Linux. Checked out with CRLF (the Windows default)
+# a shell script fails with "bad interpreter: /usr/bin/env bash^M", and
+# systemd silently mis-parses unit files, so force LF regardless of platform.
+*.sh            text eol=lf
+*.service       text eol=lf
+Caddyfile       text eol=lf
+*.env.example   text eol=lf
+*.py            text eol=lf
