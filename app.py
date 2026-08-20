@@ -39,7 +39,9 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import urlsplit
 
 import requests
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import (Flask, g, has_request_context, jsonify, redirect,
+                   render_template, request, session, url_for)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -47,12 +49,14 @@ from flask import Flask, jsonify, redirect, render_template, request, session, u
 # Used only to seed the first ("Default") instance the very first time the
 # app runs. After that, instances live in the `instances` table and are
 # managed from the dashboard's sidebar.
-DEFAULT_TARGET_URL = "http://54.90.214.41:9100/metrics"
+DEFAULT_TARGET_URL = os.environ.get("DEFAULT_TARGET_URL", "")
 SCRAPE_INTERVAL_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
 EVENT_LOG_RETENTION_DAYS = 3
-DB_PATH = "metrics.db"
-LOG_FILE_PATH = "vps_monitor.log"
+AUDIT_LOG_RETENTION_DAYS = 90
+DB_PATH = os.environ.get("DB_PATH", "metrics.db")
+LOG_FILE_PATH = os.environ.get("LOG_FILE_PATH", "vps_monitor.log")
+SQLITE_TIMEOUT_SECONDS = 30
 
 # A real log file (rotates at ~2MB, keeps 3 backups) plus console output -
 # every scrape, error, and status change goes through this instead of bare
@@ -132,54 +136,270 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 # ---------------------------------------------------------------------------
-# Login - gates the whole app (dashboard + every /api/* route) behind a
-# single admin account. No user database: credentials come from environment
-# variables, or a random one-off password printed at startup.
+# Accounts, roles and sessions
+#
+# Every account lives in the `users` table (see init_db). Two roles:
+#   admin  - full control: instances, thresholds, alerts, users, everything
+#   viewer - read-only: dashboards, health checks and logs, nothing mutating
+# All accounts see the same fleet of VPS instances; the role decides what
+# they're allowed to change, not what they're allowed to see.
+#
+# There is no public signup. The first admin is created at setup (from
+# APP_USERNAME/APP_PASSWORD, or a generated password printed once), and that
+# admin creates every other account.
 # ---------------------------------------------------------------------------
-APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
-APP_PASSWORD = os.environ.get("APP_PASSWORD")
-if not APP_PASSWORD:
-    APP_PASSWORD = secrets.token_urlsafe(9)
-    print("=" * 64)
-    print("No APP_PASSWORD set - generated a login for this run only:")
-    print(f"    username: {APP_USERNAME}")
-    print(f"    password: {APP_PASSWORD}")
-    print("Set APP_USERNAME / APP_PASSWORD env vars for a fixed login that")
-    print("survives restarts.")
-    print("=" * 64)
-
-# Regenerated every time the process starts, and required (alongside
-# "logged_in") for a session to be considered valid. This forces everyone to
-# sign in again after every restart, even if SECRET_KEY is fixed and would
-# otherwise let old session cookies keep working.
-BOOT_ID = secrets.token_hex(8)
+ROLE_ADMIN = "admin"
+ROLE_VIEWER = "viewer"
+ROLES = (ROLE_ADMIN, ROLE_VIEWER)
 
 PUBLIC_ENDPOINTS = {"login", "static"}
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SECONDS = 300
-_login_attempts = {}  # ip -> [failure timestamps]
+SESSION_LIFETIME_HOURS = int(os.environ.get("SESSION_LIFETIME_HOURS", "12"))
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=SESSION_LIFETIME_HOURS)
+
+# Endpoints a signed-in *viewer* may call with a mutating HTTP verb. Everything
+# else that isn't a GET requires admin - deny-by-default, so a new endpoint
+# added later is admin-only until deliberately listed here.
+VIEWER_WRITE_ENDPOINTS = {"logout", "api_change_own_password"}
 
 
+def db():
+    """Every DB connection goes through here. The busy timeout matters once
+    there is more than one process touching the file (gunicorn workers plus
+    the separate scraper): without it, two concurrent writes raise
+    'database is locked' immediately instead of waiting their turn."""
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SECONDS)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_TIMEOUT_SECONDS * 1000}")
+    return conn
+
+
+def get_app_state(key, default=None):
+    conn = db()
+    row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_app_state(key, value):
+    conn = db()
+    conn.execute(
+        "INSERT INTO app_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_server_start():
+    """Rotate the boot id so sessions issued before this restart stop being
+    accepted. Lives in the DB rather than a module-level constant so that it
+    stays consistent across multiple gunicorn workers - each worker reads the
+    same value instead of inventing its own (which would log users out at
+    random as requests bounced between workers)."""
+    set_app_state("boot_id", secrets.token_hex(8))
+
+
+def current_boot_id():
+    return get_app_state("boot_id", "")
+
+
+# ---------------------------------------------------------------------------
+# User records
+# ---------------------------------------------------------------------------
+def get_user_by_username(username):
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_user(user_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_users():
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, username, role, is_active, created_at, last_login_at "
+        "FROM users ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_admins(exclude_user_id=None):
+    conn = db()
+    if exclude_user_id is None:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM users WHERE role = ? AND is_active = 1", (ROLE_ADMIN,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM users WHERE role = ? AND is_active = 1 AND id != ?",
+            (ROLE_ADMIN, exclude_user_id)
+        ).fetchone()
+    conn.close()
+    return row["c"]
+
+
+def create_user(username, password, role=ROLE_VIEWER):
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO users (username, password_hash, role, is_active, created_at) "
+        "VALUES (?, ?, ?, 1, ?)",
+        (username, generate_password_hash(password), role, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    return new_id
+
+
+def update_user_password(user_id, password):
+    conn = db()
+    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                 (generate_password_hash(password), user_id))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Audit log - who did what. Distinct from event_log, which records what the
+# monitored machines did.
+# ---------------------------------------------------------------------------
+def log_audit(action, target=None, details=None, username=None, user_id=None, ip=None):
+    if username is None or user_id is None:
+        user = current_user()
+        if user:
+            username = username if username is not None else user["username"]
+            user_id = user_id if user_id is not None else user["id"]
+    if ip is None:
+        ip = request.remote_addr if request else None
+
+    conn = db()
+    conn.execute(
+        "INSERT INTO audit_log (timestamp, user_id, username, action, target, details, ip_address) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (datetime.utcnow().isoformat(), user_id, username, action, target, details, ip)
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"AUDIT {username or '-'}@{ip or '-'} {action}"
+                f"{' ' + target if target else ''}{' (' + details + ')' if details else ''}")
+
+
+def get_audit_log(limit=200, username=None, action=None):
+    limit = max(1, min(limit, 500))
+    query = "SELECT * FROM audit_log WHERE 1=1"
+    params = []
+    if username:
+        query += " AND username = ?"
+        params.append(username)
+    if action:
+        query += " AND action = ?"
+        params.append(action)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    conn = db()
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def trim_audit_log():
+    cutoff = (datetime.utcnow() - timedelta(days=AUDIT_LOG_RETENTION_DAYS)).isoformat()
+    conn = db()
+    conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Login throttling - DB-backed so the limit holds across gunicorn workers
+# rather than being counted separately inside each one.
+# ---------------------------------------------------------------------------
 def _too_many_attempts(ip):
-    now = time.time()
-    attempts = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW_SECONDS]
-    _login_attempts[ip] = attempts
-    return len(attempts) >= LOGIN_MAX_ATTEMPTS
+    cutoff = (datetime.utcnow() - timedelta(seconds=LOGIN_WINDOW_SECONDS)).isoformat()
+    conn = db()
+    conn.execute("DELETE FROM login_attempts WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    row = conn.execute(
+        "SELECT COUNT(*) c FROM login_attempts WHERE ip_address = ? AND timestamp >= ?",
+        (ip, cutoff)
+    ).fetchone()
+    conn.close()
+    return row["c"] >= LOGIN_MAX_ATTEMPTS
 
 
-def _record_failed_attempt(ip):
-    _login_attempts.setdefault(ip, []).append(time.time())
+def _record_failed_attempt(ip, username):
+    conn = db()
+    conn.execute(
+        "INSERT INTO login_attempts (ip_address, username, timestamp) VALUES (?, ?, ?)",
+        (ip, username, datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def _clear_attempts(ip):
+    conn = db()
+    conn.execute("DELETE FROM login_attempts WHERE ip_address = ?", (ip,))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Request gating
+# ---------------------------------------------------------------------------
+def current_user():
+    """The signed-in user for this request, or None. Cached on `g` so a single
+    request doesn't re-query the users table for every permission check."""
+    if not has_request_context():
+        return None
+    if "cached_user" in g:
+        return g.cached_user
+
+    user = None
+    user_id = session.get("user_id")
+    if user_id and session.get("boot_id") == current_boot_id():
+        candidate = get_user(user_id)
+        if candidate and candidate["is_active"]:
+            user = candidate
+    g.cached_user = user
+    return user
+
+
+def is_admin():
+    user = current_user()
+    return bool(user and user["role"] == ROLE_ADMIN)
 
 
 @app.before_request
 def require_login():
     if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint is None:
         return
-    if session.get("logged_in") and session.get("boot_id") == BOOT_ID:
-        return
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "authentication required"}), 401
-    return redirect(url_for("login", next=request.path))
+
+    user = current_user()
+    if not user:
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "authentication required"}), 401
+        return redirect(url_for("login", next=request.path))
+
+    session.permanent = True
+    # Deny-by-default: anything that isn't a plain read needs admin, unless
+    # the endpoint is explicitly listed as viewer-writable.
+    if request.method not in ("GET", "HEAD", "OPTIONS") \
+            and request.endpoint not in VIEWER_WRITE_ENDPOINTS \
+            and user["role"] != ROLE_ADMIN:
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "admin role required for this action"}), 403
+        return jsonify({"error": "admin role required for this action"}), 403
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -187,27 +407,48 @@ def login():
     error = None
     if request.method == "POST":
         ip = request.remote_addr or "unknown"
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
         if _too_many_attempts(ip):
             error = "Too many failed attempts. Try again in a few minutes."
+            log_audit("login.throttled", target=username or None,
+                      username=username or None, user_id=None, ip=ip)
         else:
-            username = request.form.get("username", "")
-            password = request.form.get("password", "")
-            if username == APP_USERNAME and secrets.compare_digest(password, APP_PASSWORD):
+            user = get_user_by_username(username)
+            if user and user["is_active"] and check_password_hash(user["password_hash"], password):
+                _clear_attempts(ip)
                 session.clear()
-                session["logged_in"] = True
-                session["username"] = username
-                session["boot_id"] = BOOT_ID
+                session.permanent = True
+                session["user_id"] = user["id"]
+                session["username"] = user["username"]
+                session["boot_id"] = current_boot_id()
+
+                conn = db()
+                conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?",
+                             (datetime.utcnow().isoformat(), user["id"]))
+                conn.commit()
+                conn.close()
+
+                log_audit("login.success", username=user["username"], user_id=user["id"], ip=ip)
                 next_path = request.args.get("next") or "/"
                 if not next_path.startswith("/"):
                     next_path = "/"
                 return redirect(next_path)
-            _record_failed_attempt(ip)
+
+            _record_failed_attempt(ip, username)
+            reason = "disabled account" if (user and not user["is_active"]) else "bad credentials"
+            log_audit("login.failed", target=username or None, details=reason,
+                      username=username or None, user_id=None, ip=ip)
             error = "Invalid username or password."
     return render_template("login.html", error=error)
 
 
 @app.route("/logout", methods=["POST"])
 def logout():
+    user = current_user()
+    if user:
+        log_audit("logout", username=user["username"], user_id=user["id"])
     session.clear()
     return redirect(url_for("login"))
 
@@ -216,7 +457,10 @@ def logout():
 # Database (SQLite acts as our mini time-series store)
 # ---------------------------------------------------------------------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
+    # WAL lets the web workers keep reading while the scraper writes, instead
+    # of the two blocking each other on every sample.
+    conn.execute("PRAGMA journal_mode = WAL")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS instances (
@@ -295,7 +539,54 @@ def init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_event_log_instance ON event_log(instance_id)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'viewer',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            last_login_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_id INTEGER,
+            username TEXT,
+            action TEXT NOT NULL,
+            target TEXT,
+            details TEXT,
+            ip_address TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            username TEXT,
+            timestamp TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     conn.commit()
+
+    if conn.execute("SELECT value FROM app_state WHERE key = 'boot_id'").fetchone() is None:
+        conn.execute("INSERT INTO app_state (key, value) VALUES ('boot_id', ?)",
+                     (secrets.token_hex(8),))
+        conn.commit()
 
     # --- migrate a pre-multi-instance / pre-severity-tier metrics.db in place ---
     cols = [r[1] for r in conn.execute("PRAGMA table_info(metrics)").fetchall()]
@@ -369,7 +660,10 @@ def init_db():
                 )
         conn.commit()
 
-    if conn.execute("SELECT id FROM instances LIMIT 1").fetchone() is None:
+    # Seed a first instance only when DEFAULT_TARGET_URL is explicitly set -
+    # a fresh install on someone else's server should start empty, not
+    # pre-pointed at a hard-coded address.
+    if DEFAULT_TARGET_URL and conn.execute("SELECT id FROM instances LIMIT 1").fetchone() is None:
         cur = conn.execute(
             "INSERT INTO instances (name, target_url, created_at) VALUES (?, ?, ?)",
             ("Default", DEFAULT_TARGET_URL, datetime.utcnow().isoformat())
@@ -379,6 +673,41 @@ def init_db():
         conn.commit()
 
     conn.close()
+    bootstrap_admin_user()
+
+
+def bootstrap_admin_user():
+    """Create the first admin account if the users table is empty. Uses
+    APP_USERNAME/APP_PASSWORD when provided (so existing setups keep their
+    credentials), otherwise generates a password and prints it once."""
+    conn = db()
+    existing = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    conn.close()
+    if existing:
+        return None
+
+    username = os.environ.get("APP_USERNAME", "admin")
+    password = os.environ.get("APP_PASSWORD")
+    generated = not password
+    if generated:
+        password = secrets.token_urlsafe(12)
+
+    create_user(username, password, ROLE_ADMIN)
+    log_audit("user.bootstrap", target=username, details="initial admin account",
+              username="system", user_id=None, ip=None)
+
+    if generated:
+        print("=" * 68)
+        print("No APP_PASSWORD set - created the first admin account with a")
+        print("generated password. Save it now, it is not shown again:")
+        print(f"    username: {username}")
+        print(f"    password: {password}")
+        print("Change it from the Users panel, or set APP_USERNAME/APP_PASSWORD")
+        print("before first run to choose your own.")
+        print("=" * 68)
+    else:
+        logger.info(f"Created first admin account '{username}' from APP_USERNAME/APP_PASSWORD")
+    return username
 
 
 def get_instances(include_secrets=False):
@@ -386,8 +715,7 @@ def get_instances(include_secrets=False):
     scrape loop's own use. Every API-facing caller gets include_secrets=False
     (the default), so the password never round-trips into a browser response;
     `has_auth` tells the UI whether one is set without revealing it."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     rows = conn.execute("SELECT * FROM instances ORDER BY id").fetchall()
     conn.close()
     instances = [dict(r) for r in rows]
@@ -403,7 +731,7 @@ def get_instances(include_secrets=False):
 
 
 def save_metrics(instance_id, m):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute("""
         INSERT INTO metrics
         (instance_id, timestamp, cpu_percent, mem_percent, mem_used_mb, mem_total_mb,
@@ -423,8 +751,7 @@ def save_metrics(instance_id, m):
 
 
 def get_latest(instance_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     row = conn.execute(
         "SELECT * FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT 1", (instance_id,)
     ).fetchone()
@@ -433,8 +760,7 @@ def get_latest(instance_id):
 
 
 def get_history(instance_id, limit=60):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     rows = conn.execute(
         "SELECT * FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT ?", (instance_id, limit)
     ).fetchall()
@@ -471,8 +797,7 @@ def get_history_range(instance_id, seconds, max_points=300):
     Downsamples (bucket-averaged) to at most `max_points` rows so a 7-day
     view doesn't ship tens of thousands of points to the browser."""
     cutoff = (datetime.utcnow() - timedelta(seconds=seconds)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     rows = conn.execute(
         "SELECT * FROM metrics WHERE instance_id = ? AND timestamp >= ? ORDER BY id ASC",
         (instance_id, cutoff)
@@ -485,8 +810,7 @@ def get_history_range(instance_id, seconds, max_points=300):
 
 
 def get_thresholds(instance_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     row = conn.execute(
         "SELECT * FROM alert_thresholds WHERE instance_id = ?", (instance_id,)
     ).fetchone()
@@ -500,8 +824,7 @@ def get_thresholds(instance_id):
 
 
 def get_subscriptions(instance_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     rows = conn.execute(
         "SELECT * FROM alert_subscriptions WHERE instance_id = ? ORDER BY id", (instance_id,)
     ).fetchall()
@@ -515,8 +838,7 @@ def get_subscriptions(instance_id):
 def get_all_subscriptions():
     """Every subscription across every instance, with the instance's name
     joined in - the data behind the Alerts page's global recipients table."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     rows = conn.execute("""
         SELECT s.*, i.name AS instance_name, i.target_url AS instance_url
         FROM alert_subscriptions s
@@ -542,7 +864,7 @@ def emails_for_alert_type(subscriptions, alert_type):
 # vps_monitor.log even though only the noteworthy stuff is stored here.
 # ---------------------------------------------------------------------------
 def log_event(level, category, message, instance_id=None, instance_name=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute(
         "INSERT INTO event_log (timestamp, instance_id, instance_name, level, category, message) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -557,7 +879,7 @@ def log_event(level, category, message, instance_id=None, instance_name=None):
 
 def trim_event_log():
     cutoff = (datetime.utcnow() - timedelta(days=EVENT_LOG_RETENTION_DAYS)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute("DELETE FROM event_log WHERE timestamp < ?", (cutoff,))
     conn.commit()
     conn.close()
@@ -565,8 +887,7 @@ def trim_event_log():
 
 def get_logs(instance_id=None, level=None, limit=200):
     limit = max(1, min(limit, 500))
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     query = "SELECT * FROM event_log WHERE 1=1"
     params = []
     if instance_id is not None:
@@ -728,7 +1049,7 @@ def extract_metrics(text, prev, now_mono):
 
 
 def set_instance_status(instance_id, status, error=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute(
         "UPDATE instances SET last_status = ?, last_error = ?, last_checked_at = ? WHERE id = ?",
         (status, error, datetime.utcnow().isoformat(), instance_id)
@@ -988,6 +1309,7 @@ def heartbeat_loop():
 
             log_event(level, "heartbeat", message, iid, inst["name"])
         trim_event_log()
+        trim_audit_log()
 
 
 # ---------------------------------------------------------------------------
@@ -1018,7 +1340,7 @@ def api_instances_create():
 
     url = normalize_target_url(url)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     try:
         cur = conn.execute(
             "INSERT INTO instances (name, target_url, created_at, auth_username, auth_password) "
@@ -1031,14 +1353,15 @@ def api_instances_create():
         conn.close()
         return jsonify({"error": "an instance with this target_url already exists"}), 409
     conn.close()
+    log_audit("instance.create", target=name,
+              details=f"{url}{' (basic auth)' if auth_username else ''}")
     return jsonify({"id": new_id, "name": name, "target_url": url}), 201
 
 
 @app.route("/api/instances/<int:instance_id>", methods=["PATCH"])
 def api_instances_update(instance_id):
     data = request.get_json(force=True, silent=True) or {}
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = db()
     row = conn.execute("SELECT * FROM instances WHERE id = ?", (instance_id,)).fetchone()
     if not row:
         conn.close()
@@ -1081,12 +1404,24 @@ def api_instances_update(instance_id):
         conn.close()
         return jsonify({"error": "an instance with this target_url already exists"}), 409
     conn.close()
+
+    changed = []
+    if name != row["name"]:
+        changed.append(f"name: {row['name']} -> {name}")
+    if url != row["target_url"]:
+        changed.append(f"url: {row['target_url']} -> {url}")
+    if auth_username != row["auth_username"]:
+        changed.append(f"basic auth user: {row['auth_username'] or 'none'} -> {auth_username or 'none'}")
+    elif auth_password != row["auth_password"]:
+        changed.append("basic auth password changed")
+    log_audit("instance.update", target=name, details="; ".join(changed) or "no effective change")
     return jsonify({"ok": True})
 
 
 @app.route("/api/instances/<int:instance_id>", methods=["DELETE"])
 def api_instances_delete(instance_id):
-    conn = sqlite3.connect(DB_PATH)
+    doomed = next((i for i in get_instances() if i["id"] == instance_id), None)
+    conn = db()
     conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
     conn.execute("DELETE FROM metrics WHERE instance_id = ?", (instance_id,))
     conn.execute("DELETE FROM alert_thresholds WHERE instance_id = ?", (instance_id,))
@@ -1096,6 +1431,8 @@ def api_instances_delete(instance_id):
     _prev_state.pop(instance_id, None)
     _prev_severity.pop(instance_id, None)
     _prev_health.pop(instance_id, None)
+    log_audit("instance.delete", target=doomed["name"] if doomed else f"id={instance_id}",
+              details="instance and all of its history removed")
     return jsonify({"ok": True})
 
 
@@ -1139,7 +1476,7 @@ def api_thresholds_set():
         values[f"{key}_warn"] = clean(data.get(f"{key}_warn"))
         values[f"{key}_crit"] = clean(data.get(f"{key}_crit"))
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     conn.execute("""
         INSERT INTO alert_thresholds
             (instance_id, cpu_warn, cpu_crit, mem_warn, mem_crit,
@@ -1155,12 +1492,157 @@ def api_thresholds_set():
     """, values)
     conn.commit()
     conn.close()
+
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    summary = ", ".join(
+        f"{key}={values[f'{key}_warn'] if values[f'{key}_warn'] is not None else '-'}"
+        f"/{values[f'{key}_crit'] if values[f'{key}_crit'] is not None else '-'}"
+        for key in METRIC_DEFS
+    )
+    log_audit("thresholds.update", target=inst["name"] if inst else f"instance {instance_id}",
+              details=f"warn/crit -> {summary}")
     return jsonify({"ok": True})
 
 
 @app.route("/api/alert-types")
 def api_alert_types():
     return jsonify([{"key": k, "label": v} for k, v in ALERT_TYPE_LABELS.items()])
+
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+@app.route("/api/me")
+def api_me():
+    user = current_user()
+    return jsonify({"id": user["id"], "username": user["username"],
+                     "role": user["role"], "is_admin": user["role"] == ROLE_ADMIN})
+
+
+@app.route("/api/users")
+def api_users_list():
+    if not is_admin():
+        return jsonify({"error": "admin role required"}), 403
+    return jsonify(list_users())
+
+
+@app.route("/api/users", methods=["POST"])
+def api_users_create():
+    data = request.get_json(force=True, silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    role = (data.get("role") or ROLE_VIEWER).strip()
+
+    if not username or not re.match(r'^[A-Za-z0-9._-]{3,32}$', username):
+        return jsonify({"error": "username must be 3-32 chars (letters, digits, . _ -)"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "password must be at least 8 characters"}), 400
+    if role not in ROLES:
+        return jsonify({"error": f"role must be one of: {', '.join(ROLES)}"}), 400
+
+    try:
+        new_id = create_user(username, password, role)
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "that username is already taken"}), 409
+
+    log_audit("user.create", target=username, details=f"role={role}")
+    return jsonify({"id": new_id, "username": username, "role": role}), 201
+
+
+@app.route("/api/users/<int:user_id>", methods=["PATCH"])
+def api_users_update(user_id):
+    data = request.get_json(force=True, silent=True) or {}
+    target = get_user(user_id)
+    if not target:
+        return jsonify({"error": "user not found"}), 404
+
+    changes = []
+
+    if "role" in data:
+        role = (data.get("role") or "").strip()
+        if role not in ROLES:
+            return jsonify({"error": f"role must be one of: {', '.join(ROLES)}"}), 400
+        # Don't allow demoting the last remaining admin - that would lock
+        # everyone out of user management with no way back in.
+        if target["role"] == ROLE_ADMIN and role != ROLE_ADMIN and count_admins(user_id) == 0:
+            return jsonify({"error": "cannot demote the last admin account"}), 400
+        conn = db()
+        conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+        conn.commit()
+        conn.close()
+        changes.append(f"role={role}")
+
+    if "is_active" in data:
+        active = 1 if data.get("is_active") else 0
+        if not active and target["role"] == ROLE_ADMIN and count_admins(user_id) == 0:
+            return jsonify({"error": "cannot disable the last admin account"}), 400
+        conn = db()
+        conn.execute("UPDATE users SET is_active = ? WHERE id = ?", (active, user_id))
+        conn.commit()
+        conn.close()
+        changes.append("enabled" if active else "disabled")
+
+    if data.get("password"):
+        if len(data["password"]) < 8:
+            return jsonify({"error": "password must be at least 8 characters"}), 400
+        update_user_password(user_id, data["password"])
+        changes.append("password reset")
+
+    if not changes:
+        return jsonify({"error": "nothing to update"}), 400
+
+    log_audit("user.update", target=target["username"], details=", ".join(changes))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+def api_users_delete(user_id):
+    target = get_user(user_id)
+    if not target:
+        return jsonify({"error": "user not found"}), 404
+
+    me = current_user()
+    if me and me["id"] == user_id:
+        return jsonify({"error": "you cannot delete your own account"}), 400
+    if target["role"] == ROLE_ADMIN and count_admins(user_id) == 0:
+        return jsonify({"error": "cannot delete the last admin account"}), 400
+
+    conn = db()
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    log_audit("user.delete", target=target["username"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/me/password", methods=["POST"])
+def api_change_own_password():
+    data = request.get_json(force=True, silent=True) or {}
+    user = current_user()
+    current_password = data.get("current_password") or ""
+    new_password = data.get("new_password") or ""
+
+    if not check_password_hash(user["password_hash"], current_password):
+        log_audit("password.change_failed", target=user["username"],
+                   details="current password incorrect")
+        return jsonify({"error": "current password is incorrect"}), 403
+    if len(new_password) < 8:
+        return jsonify({"error": "new password must be at least 8 characters"}), 400
+
+    update_user_password(user["id"], new_password)
+    log_audit("password.changed", target=user["username"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/audit")
+def api_audit():
+    if not is_admin():
+        return jsonify({"error": "admin role required"}), 403
+    return jsonify(get_audit_log(
+        limit=request.args.get("limit", default=200, type=int),
+        username=request.args.get("username") or None,
+        action=request.args.get("action") or None,
+    ))
 
 
 @app.route("/api/logs")
@@ -1193,7 +1675,7 @@ def api_subscriptions_create():
     if alert_type not in ALERT_TYPE_LABELS:
         return jsonify({"error": "unknown alert_type"}), 400
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
     try:
         cur = conn.execute(
             "INSERT INTO alert_subscriptions (instance_id, email, alert_type, created_at) "
@@ -1206,21 +1688,29 @@ def api_subscriptions_create():
         conn.close()
         return jsonify({"error": "that email is already subscribed to this alert"}), 409
     conn.close()
+    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
+    log_audit("subscription.create", target=email,
+              details=f"{ALERT_TYPE_LABELS[alert_type]} on {inst['name'] if inst else instance_id}")
     return jsonify({"id": new_id, "instance_id": instance_id, "email": email,
                      "alert_type": alert_type, "alert_type_label": ALERT_TYPE_LABELS[alert_type]}), 201
 
 
 @app.route("/api/subscriptions/<int:sub_id>", methods=["DELETE"])
 def api_subscriptions_delete(sub_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db()
+    row = conn.execute("SELECT * FROM alert_subscriptions WHERE id = ?", (sub_id,)).fetchone()
     conn.execute("DELETE FROM alert_subscriptions WHERE id = ?", (sub_id,))
     conn.commit()
     conn.close()
+    if row:
+        log_audit("subscription.delete", target=row["email"],
+                  details=ALERT_TYPE_LABELS.get(row["alert_type"], row["alert_type"]))
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
     init_db()
+    mark_server_start()
     threading.Thread(target=scrape_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
