@@ -446,6 +446,9 @@ def cmd_init(args):
     ok(f"Database ready at {app.DB_PATH}")
     if not created:
         ok(f"{len(app.list_users())} account(s) already exist - left untouched.")
+    if args.rotate_sessions:
+        app.mark_server_start()
+        ok("Rotated the session epoch - everyone must sign in again.")
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +459,10 @@ def build_parser():
         prog="vpsmon", description="Administer the VPS monitor from the command line.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("init", help="create/upgrade the database and first admin").set_defaults(func=cmd_init)
+    p = sub.add_parser("init", help="create/upgrade the database and first admin")
+    p.add_argument("--rotate-sessions", action="store_true",
+                   help="also invalidate every existing login session")
+    p.set_defaults(func=cmd_init)
     sub.add_parser("status", help="one-line health summary of every instance").set_defaults(func=cmd_status)
 
     # --- instance ---

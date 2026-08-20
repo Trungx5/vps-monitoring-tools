@@ -1,0 +1,28 @@
+[Unit]
+Description=VPS Monitor - metrics scraper
+After=network.target
+
+[Service]
+Type=simple
+User=vpsmon
+Group=vpsmon
+WorkingDirectory=/opt/vpsmon/app
+EnvironmentFile=/etc/vpsmon/vpsmon.env
+
+# Exactly one scraper process, always. Running a second copy would double the
+# load on every monitored machine and send duplicate alert emails.
+ExecStart=/opt/vpsmon/venv/bin/python scraper.py
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/vpsmon/data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

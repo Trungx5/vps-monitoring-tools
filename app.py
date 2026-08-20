@@ -139,9 +139,19 @@ ALERT_TYPE_LABELS = {
 }
 
 app = Flask(__name__)
+# A per-process random fallback is fine for single-process development, but
+# fatal with multiple workers: each would sign cookies with a different key and
+# users would appear randomly logged out. wsgi.py refuses to start without a
+# configured key for exactly that reason.
+SECRET_KEY_CONFIGURED = bool(os.environ.get("SECRET_KEY"))
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Set SECURE_COOKIES=1 once the app is served over HTTPS so the session cookie
+# is never sent over plaintext. Left off by default because switching it on
+# while serving plain HTTP silently breaks login (the browser withholds the
+# cookie and every request looks logged-out).
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SECURE_COOKIES", "") == "1"
 
 # ---------------------------------------------------------------------------
 # Accounts, roles and sessions
