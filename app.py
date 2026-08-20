@@ -33,7 +33,7 @@ import smtplib
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlsplit
@@ -72,6 +72,14 @@ logger.addHandler(_file_handler)
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_log_formatter)
 logger.addHandler(_console_handler)
+
+
+def utcnow():
+    """Naive UTC 'now'. utcnow() is deprecated, but every timestamp
+    already stored in the database - and the format the dashboard parses - is
+    naive UTC, so this keeps the exact same string format without the warning."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
@@ -252,7 +260,7 @@ def create_user(username, password, role=ROLE_VIEWER):
     cur = conn.execute(
         "INSERT INTO users (username, password_hash, role, is_active, created_at) "
         "VALUES (?, ?, ?, 1, ?)",
-        (username, generate_password_hash(password), role, datetime.utcnow().isoformat())
+        (username, generate_password_hash(password), role, utcnow().isoformat())
     )
     conn.commit()
     new_id = cur.lastrowid
@@ -285,7 +293,7 @@ def log_audit(action, target=None, details=None, username=None, user_id=None, ip
     conn.execute(
         "INSERT INTO audit_log (timestamp, user_id, username, action, target, details, ip_address) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (datetime.utcnow().isoformat(), user_id, username, action, target, details, ip)
+        (utcnow().isoformat(), user_id, username, action, target, details, ip)
     )
     conn.commit()
     conn.close()
@@ -313,7 +321,7 @@ def get_audit_log(limit=200, username=None, action=None):
 
 
 def trim_audit_log():
-    cutoff = (datetime.utcnow() - timedelta(days=AUDIT_LOG_RETENTION_DAYS)).isoformat()
+    cutoff = (utcnow() - timedelta(days=AUDIT_LOG_RETENTION_DAYS)).isoformat()
     conn = db()
     conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (cutoff,))
     conn.commit()
@@ -325,7 +333,7 @@ def trim_audit_log():
 # rather than being counted separately inside each one.
 # ---------------------------------------------------------------------------
 def _too_many_attempts(ip):
-    cutoff = (datetime.utcnow() - timedelta(seconds=LOGIN_WINDOW_SECONDS)).isoformat()
+    cutoff = (utcnow() - timedelta(seconds=LOGIN_WINDOW_SECONDS)).isoformat()
     conn = db()
     conn.execute("DELETE FROM login_attempts WHERE timestamp < ?", (cutoff,))
     conn.commit()
@@ -341,7 +349,7 @@ def _record_failed_attempt(ip, username):
     conn = db()
     conn.execute(
         "INSERT INTO login_attempts (ip_address, username, timestamp) VALUES (?, ?, ?)",
-        (ip, username, datetime.utcnow().isoformat())
+        (ip, username, utcnow().isoformat())
     )
     conn.commit()
     conn.close()
@@ -426,7 +434,7 @@ def login():
 
                 conn = db()
                 conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?",
-                             (datetime.utcnow().isoformat(), user["id"]))
+                             (utcnow().isoformat(), user["id"]))
                 conn.commit()
                 conn.close()
 
@@ -656,7 +664,7 @@ def init_db():
                 conn.execute(
                     "INSERT OR IGNORE INTO alert_subscriptions "
                     "(instance_id, email, alert_type, created_at) VALUES (?, ?, ?, ?)",
-                    (instance_id, email, alert_type, datetime.utcnow().isoformat())
+                    (instance_id, email, alert_type, utcnow().isoformat())
                 )
         conn.commit()
 
@@ -666,7 +674,7 @@ def init_db():
     if DEFAULT_TARGET_URL and conn.execute("SELECT id FROM instances LIMIT 1").fetchone() is None:
         cur = conn.execute(
             "INSERT INTO instances (name, target_url, created_at) VALUES (?, ?, ?)",
-            ("Default", DEFAULT_TARGET_URL, datetime.utcnow().isoformat())
+            ("Default", DEFAULT_TARGET_URL, utcnow().isoformat())
         )
         default_id = cur.lastrowid
         conn.execute("UPDATE metrics SET instance_id = ? WHERE instance_id IS NULL", (default_id,))
@@ -796,7 +804,7 @@ def get_history_range(instance_id, seconds, max_points=300):
     """Everything since `seconds` ago, for the dashboard's time-range picker.
     Downsamples (bucket-averaged) to at most `max_points` rows so a 7-day
     view doesn't ship tens of thousands of points to the browser."""
-    cutoff = (datetime.utcnow() - timedelta(seconds=seconds)).isoformat()
+    cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
     conn = db()
     rows = conn.execute(
         "SELECT * FROM metrics WHERE instance_id = ? AND timestamp >= ? ORDER BY id ASC",
@@ -868,7 +876,7 @@ def log_event(level, category, message, instance_id=None, instance_name=None):
     conn.execute(
         "INSERT INTO event_log (timestamp, instance_id, instance_name, level, category, message) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        (datetime.utcnow().isoformat(), instance_id, instance_name, level, category, message)
+        (utcnow().isoformat(), instance_id, instance_name, level, category, message)
     )
     conn.commit()
     conn.close()
@@ -878,7 +886,7 @@ def log_event(level, category, message, instance_id=None, instance_name=None):
 
 
 def trim_event_log():
-    cutoff = (datetime.utcnow() - timedelta(days=EVENT_LOG_RETENTION_DAYS)).isoformat()
+    cutoff = (utcnow() - timedelta(days=EVENT_LOG_RETENTION_DAYS)).isoformat()
     conn = db()
     conn.execute("DELETE FROM event_log WHERE timestamp < ?", (cutoff,))
     conn.commit()
@@ -1024,7 +1032,7 @@ def extract_metrics(text, prev, now_mono):
     rates, new_state = compute_rates(parsed, prev, now_mono)
 
     metrics = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": utcnow().isoformat(),
         "cpu_percent": rates["cpu_percent"],
         "cpu_count": rates["cpu_count"],
         "mem_percent": mem_percent,
@@ -1052,7 +1060,7 @@ def set_instance_status(instance_id, status, error=None):
     conn = db()
     conn.execute(
         "UPDATE instances SET last_status = ?, last_error = ?, last_checked_at = ? WHERE id = ?",
-        (status, error, datetime.utcnow().isoformat(), instance_id)
+        (status, error, utcnow().isoformat(), instance_id)
     )
     conn.commit()
     conn.close()
@@ -1345,7 +1353,7 @@ def api_instances_create():
         cur = conn.execute(
             "INSERT INTO instances (name, target_url, created_at, auth_username, auth_password) "
             "VALUES (?, ?, ?, ?, ?)",
-            (name, url, datetime.utcnow().isoformat(), auth_username, auth_password)
+            (name, url, utcnow().isoformat(), auth_username, auth_password)
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -1680,7 +1688,7 @@ def api_subscriptions_create():
         cur = conn.execute(
             "INSERT INTO alert_subscriptions (instance_id, email, alert_type, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (instance_id, email, alert_type, datetime.utcnow().isoformat())
+            (instance_id, email, alert_type, utcnow().isoformat())
         )
         conn.commit()
         new_id = cur.lastrowid
