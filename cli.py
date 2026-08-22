@@ -441,11 +441,23 @@ def cmd_audit(args):
 # init
 # ---------------------------------------------------------------------------
 def cmd_init(args):
+    # init_db() creates the schema and bootstraps the first admin itself, so
+    # count accounts beforehand to report accurately rather than calling the
+    # bootstrap twice (which would always look like "already exists").
+    try:
+        users_before = len(app.list_users())
+    except sqlite3.OperationalError:
+        users_before = 0  # database or users table does not exist yet
+
     app.init_db()
-    created = app.bootstrap_admin_user()
     ok(f"Database ready at {app.DB_PATH}")
-    if not created:
-        ok(f"{len(app.list_users())} account(s) already exist - left untouched.")
+
+    users_after = app.list_users()
+    if users_before == 0 and users_after:
+        ok(f"Created first admin account: {users_after[0]['username']!r}")
+    else:
+        ok(f"{len(users_after)} account(s) already exist - left untouched.")
+
     if args.rotate_sessions:
         app.mark_server_start()
         ok("Rotated the session epoch - everyone must sign in again.")
