@@ -19,6 +19,13 @@ ExecStart=/opt/vpsmon/venv/bin/python scraper.py
 Restart=always
 RestartSec=10
 
+# ICMP needs a raw socket. NoNewPrivileges makes systemd ignore the file
+# capability on /usr/bin/ping, so without this every ping-method target
+# reports permanently down while ping still works fine from a shell.
+# Granted ambiently and bounded to just this one capability.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

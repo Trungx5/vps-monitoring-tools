@@ -247,6 +247,10 @@ def db():
     conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {SQLITE_TIMEOUT_SECONDS * 1000}")
+    # journal_mode is stored in the database file, but synchronous is a
+    # per-connection setting - setting it once at init does nothing for the
+    # connections that actually do the writing.
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -1899,6 +1903,12 @@ def _ping_once(host, timeout_s=3):
     except Exception:
         return None
     if proc.returncode != 0:
+        # Distinguish "cannot send ICMP at all" from "host did not answer" -
+        # otherwise a sandbox that blocks raw sockets looks like every host
+        # being down, which is a very confusing thing to debug.
+        stderr = (proc.stderr or "") + (proc.stdout or "")
+        if "not permitted" in stderr.lower() or "cap_net_raw" in stderr.lower():
+            raise PermissionError("ICMP not permitted for this process (needs CAP_NET_RAW)")
         return None
     m = re.search(r'time[=<]\s*([\d.]+)\s*ms', proc.stdout, re.I)
     if m:
@@ -1933,9 +1943,13 @@ def check_ip_target(target):
         finally:
             sock.close()
     else:
-        latency = _ping_once(address)
+        try:
+            latency = _ping_once(address)
+        except PermissionError as e:
+            result["error"] = f"{e} - use a TCP check instead, or grant the capability"
+            return result
         if latency is None:
-            result["error"] = "no ICMP reply (host down, or ICMP blocked)"
+            result["error"] = "no ICMP reply (host down, or ICMP blocked in transit)"
         else:
             result["latency_ms"] = latency
             result["ok"] = 1
