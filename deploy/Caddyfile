@@ -10,6 +10,20 @@
 # already point at this server, and ports 80 and 443 must be reachable, or
 # certificate issuance fails.
 
+# Using a free DuckDNS name instead of your own domain? Replace the line below
+# with your subdomain and everything else works unchanged - Let's Encrypt
+# issues certificates for *.duckdns.org normally:
+#
+#     yourname.duckdns.org {
+#         encode gzip
+#         reverse_proxy 127.0.0.1:5000
+#     }
+#
+# Ports 80 and 443 must be open in the EC2 Security Group. Port 80 is required
+# for the certificate challenge even though the site itself runs on 443, and
+# Caddy redirects it to HTTPS afterwards. Do NOT open port 5000 - the app is
+# only meant to be reachable through this proxy.
+
 monitor.example.com {
     encode gzip
 
