@@ -144,6 +144,9 @@ TRAFFIC_ANOMALY_MULTIPLIER = 5.0     # current bandwidth > this * recent baselin
 TRAFFIC_ANOMALY_MIN_SAMPLES = 5      # need this many history rows to trust a baseline
 TRAFFIC_ANOMALY_FLOOR_BPS = 5000     # ignore spikes below this - idle noise, not an anomaly
 REBOOT_JITTER_SECONDS = 60           # allow boot_time to wobble this much before calling it a reboot
+# Below this, a "seconds" reading is a duration, not a date (2001-09-09). Used
+# to tell a boot timestamp apart from an uptime counter - see _gauges_windows().
+UNIX_TIMESTAMP_FLOOR = 1_000_000_000
 
 # Every alert condition a subscription row can point at - the 5 graduated
 # metrics plus the 7 pass/fail health checks, in one flat namespace so a
@@ -1370,6 +1373,24 @@ def _windows_system_volume(parsed):
     return max(pool, key=pool.get) if pool else None
 
 
+def _windows_boot_time(first):
+    """Boot time as a Unix timestamp, from whichever name this build uses.
+
+    Some windows_exporter builds report *uptime* under
+    windows_system_boot_time_timestamp_seconds despite its name and HELP text
+    both saying timestamp. Taken at face value that value climbs by one scrape
+    interval every scrape, so the reboot check reads every sample as a restart
+    the moment SCRAPE_INTERVAL_SECONDS exceeds REBOOT_JITTER_SECONDS. Anything
+    too small to be a real timestamp is therefore treated as a duration and
+    converted into the boot time it implies - which is stable between scrapes,
+    exactly like node_boot_time_seconds, and still jumps on an actual reboot."""
+    value = first("windows_system_boot_time_timestamp_seconds",
+                  "windows_system_system_up_time")
+    if value is None:
+        return None
+    return value if value >= UNIX_TIMESTAMP_FLOOR else time.time() - value
+
+
 def _gauges_windows(parsed):
     """windows_exporter equivalents of the readings above.
 
@@ -1398,7 +1419,7 @@ def _gauges_windows(parsed):
         "swap_free": total("windows_pagefile_free_bytes", "windows_os_paging_free_bytes"),
         "fs_readonly": None,
         "net_ifaces_down": None,
-        "boot_time": first("windows_system_system_up_time"),
+        "boot_time": _windows_boot_time(first),
         "load1": first("windows_system_processor_queue_length"),
     }
 
