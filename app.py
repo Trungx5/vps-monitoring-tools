@@ -66,6 +66,10 @@ AUDIT_LOG_RETENTION_DAYS = 90
 # The metrics table used to grow without bound. On a small device that fills
 # the disk (and wears the SD card) long before anything else does.
 METRICS_RETENTION_DAYS = int(os.environ.get("METRICS_RETENTION_DAYS", "14"))
+# SCRAPE_LOG=0 demotes the per-scrape success line to DEBUG. On flash-storage
+# devices that log line is a file write (twice, with journald) per instance
+# every 10 seconds; the 30s heartbeat still gives an is-it-working signal.
+SCRAPE_LOG = os.environ.get("SCRAPE_LOG", "1") == "1"
 DB_PATH = os.environ.get("DB_PATH", "metrics.db")
 LOG_FILE_PATH = os.environ.get("LOG_FILE_PATH", "vps_monitor.log")
 SQLITE_TIMEOUT_SECONDS = 30
@@ -475,10 +479,34 @@ def is_admin():
     return bool(user and user["role"] == ROLE_ADMIN)
 
 
+@app.after_request
+def security_headers(resp):
+    # The dashboard is same-origin only; nothing here should ever be framed,
+    # content-sniffed, or leak URLs via Referer.
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
 @app.before_request
 def require_login():
     if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint is None:
         return
+
+    # CSRF defense-in-depth on top of SameSite=Lax cookies: every legitimate
+    # mutating request comes from the dashboard's own JS, so when the browser
+    # supplies an Origin header it must match the host being asked. Requests
+    # without the header (curl, same-site GET navigations) pass - the session
+    # cookie is still required either way.
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("Origin")
+        if origin:
+            from urllib.parse import urlsplit as _us
+            if _us(origin).netloc != request.host:
+                return jsonify({"error": "cross-origin request rejected"}), 403
 
     user = current_user()
     if not user:
@@ -527,7 +555,10 @@ def login():
 
                 log_audit("login.success", username=user["username"], user_id=user["id"], ip=ip)
                 next_path = request.args.get("next") or "/"
-                if not next_path.startswith("/"):
+                # A bare leading slash is not enough: "//evil.com" and
+                # "/\evil.com" are protocol-relative URLs a browser will
+                # happily leave the site for.
+                if not next_path.startswith("/") or next_path.startswith(("//", "/\\")):
                     next_path = "/"
                 return redirect(next_path)
 
@@ -650,6 +681,19 @@ def _init_db_once():
             message TEXT NOT NULL
         )
     """)
+    # The time-series tables are the only ones that grow without an upper
+    # bound in sight, and every hot query hits them one of three ways:
+    #   latest-N       WHERE key = ? ORDER BY id DESC LIMIT n
+    #   time range     WHERE key = ? AND timestamp >= ?
+    #   retention trim DELETE WHERE timestamp < ?
+    # One index per access pattern. Without these, a 30-day web_checks table
+    # (~1M rows for 21 sites) was being full-scanned by the trim every single
+    # check cycle - the largest constant CPU cost in the whole app, and the
+    # difference between "fine on a laptop" and "unusable on a Raspberry Pi".
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_instance_id ON metrics(instance_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_instance_ts ON metrics(instance_id, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp)")
+
     conn.execute("CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_event_log_instance ON event_log(instance_id)")
 
@@ -730,6 +774,8 @@ def _init_db_once():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_target ON web_checks(target_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_target_ts ON web_checks(target_id, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_timestamp ON web_checks(timestamp)")
 
     # --- IP / host monitoring ----------------------------------------------
     conn.execute("""
@@ -761,6 +807,8 @@ def _init_db_once():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_target ON ip_checks(target_id, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_target_ts ON ip_checks(target_id, timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_timestamp ON ip_checks(timestamp)")
     conn.commit()
 
     # INSERT OR IGNORE rather than check-then-insert: two services starting
@@ -917,17 +965,18 @@ def get_instances(include_secrets=False):
     `has_auth` tells the UI whether one is set without revealing it."""
     conn = db()
     rows = conn.execute("SELECT * FROM instances ORDER BY id").fetchall()
-    conn.close()
     instances = [dict(r) for r in rows]
     for inst in instances:
         inst["has_auth"] = bool(inst.get("auth_username"))
         inst["os_label"] = OS_LABELS.get(inst.get("os_type"))
         if not include_secrets:
             inst.pop("auth_password", None)
-        latest = get_latest(inst["id"])
-        thresholds = get_thresholds(inst["id"])
+        latest = get_latest(inst["id"], conn=conn)
+        thresholds = get_thresholds(inst["id"], conn=conn)
         inst["severity"] = evaluate_severity(latest, thresholds)
-        inst["health"] = evaluate_health(inst, get_history_for_health(inst["id"]))
+        inst["health"] = evaluate_health(
+            inst, get_history_for_health(inst["id"], conn=conn))
+    conn.close()
     return instances
 
 
@@ -951,12 +1000,17 @@ def save_metrics(instance_id, m):
     conn.close()
 
 
-def get_latest(instance_id):
-    conn = db()
+def get_latest(instance_id, conn=None):
+    """`conn` lets a caller that is already holding a connection (see
+    get_instances) reuse it instead of opening another one per instance."""
+    own = conn is None
+    if own:
+        conn = db()
     row = conn.execute(
         "SELECT * FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT 1", (instance_id,)
     ).fetchone()
-    conn.close()
+    if own:
+        conn.close()
     return dict(row) if row else None
 
 
@@ -979,50 +1033,59 @@ HISTORY_NUMERIC_FIELDS = [
 ]
 
 
-def _downsample_history(rows, max_points):
-    bucket_size = math.ceil(len(rows) / max_points)
-    result = []
-    for i in range(0, len(rows), bucket_size):
-        chunk = rows[i:i + bucket_size]
-        bucket = {"timestamp": chunk[-1]["timestamp"], "id": chunk[-1]["id"],
-                  "instance_id": chunk[-1]["instance_id"]}
-        for field in HISTORY_NUMERIC_FIELDS:
-            values = [r[field] for r in chunk if r.get(field) is not None]
-            bucket[field] = round(sum(values) / len(values), 2) if values else None
-        result.append(bucket)
-    return result
-
-
 def get_history_range(instance_id, seconds, max_points=300):
     """Everything since `seconds` ago, for the dashboard's time-range picker.
     Downsamples (bucket-averaged) to at most `max_points` rows so a 7-day
-    view doesn't ship tens of thousands of points to the browser."""
+    view doesn't ship tens of thousands of points to the browser.
+
+    The averaging happens in SQL: a 7-day range is ~60k raw rows, and pulling
+    them into Python dicts just to average them dominated the request. SQLite
+    walks the same rows in C and hands back only the buckets."""
     cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+    cols = "id, instance_id, timestamp, " + ", ".join(HISTORY_NUMERIC_FIELDS)
     conn = db()
-    rows = conn.execute(
-        "SELECT * FROM metrics WHERE instance_id = ? AND timestamp >= ? ORDER BY id ASC",
+    n = conn.execute(
+        "SELECT COUNT(*) FROM metrics WHERE instance_id = ? AND timestamp >= ?",
         (instance_id, cutoff)
+    ).fetchone()[0]
+    if n <= max_points:
+        rows = conn.execute(
+            f"SELECT {cols} FROM metrics WHERE instance_id = ? AND timestamp >= ? ORDER BY id ASC",
+            (instance_id, cutoff)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    bucket_seconds = max(1, math.ceil(seconds / max_points))
+    avg_cols = ", ".join(f"ROUND(AVG({f}), 2) AS {f}" for f in HISTORY_NUMERIC_FIELDS)
+    rows = conn.execute(
+        f"""SELECT MAX(id) AS id, instance_id, MAX(timestamp) AS timestamp, {avg_cols}
+            FROM metrics
+            WHERE instance_id = ? AND timestamp >= ?
+            GROUP BY CAST(strftime('%s', timestamp) AS INTEGER) / ?
+            ORDER BY id ASC""",
+        (instance_id, cutoff, bucket_seconds)
     ).fetchall()
     conn.close()
-    rows = [dict(r) for r in rows]
-    if len(rows) <= max_points:
-        return rows
-    return _downsample_history(rows, max_points)
+    return [dict(r) for r in rows]
 
 
 HEALTH_COLUMNS = ("timestamp, cpu_count, load1, swap_percent, fs_readonly, "
                   "net_ifaces_down, boot_time, net_rx_bps, net_tx_bps")
 
 
-def get_history_for_health(instance_id, limit=30):
+def get_history_for_health(instance_id, limit=30, conn=None):
     """Just the columns evaluate_health() reads. Called for every instance on
     every scrape and every dashboard poll, so it is worth keeping narrow."""
-    conn = db()
+    own = conn is None
+    if own:
+        conn = db()
     rows = conn.execute(
         f"SELECT {HEALTH_COLUMNS} FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT ?",
         (instance_id, limit)
     ).fetchall()
-    conn.close()
+    if own:
+        conn.close()
     return [dict(r) for r in reversed(rows)]
 
 
@@ -1034,12 +1097,15 @@ def trim_metrics():
     conn.close()
 
 
-def get_thresholds(instance_id):
-    conn = db()
+def get_thresholds(instance_id, conn=None):
+    own = conn is None
+    if own:
+        conn = db()
     row = conn.execute(
         "SELECT * FROM alert_thresholds WHERE instance_id = ?", (instance_id,)
     ).fetchone()
-    conn.close()
+    if own:
+        conn.close()
     if row:
         return dict(row)
     return {"instance_id": instance_id, "alert_email": None,
@@ -1934,25 +2000,37 @@ def maybe_alert_web(target, health, subscriptions, latest):
             send_alert_email(email, subject, body)
 
 
-def get_web_stats(target_id, seconds):
-    """Uptime and latency summary over a window. Computed from the checks
-    already stored, so no extra polling is involved."""
-    cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
-    conn = db()
-    rows = conn.execute(
-        "SELECT ok, response_ms FROM web_checks WHERE target_id = ? AND timestamp >= ?",
-        (target_id, cutoff)
-    ).fetchall()
-    conn.close()
+# The uptime view asks for 3 windows x every target in one page load, and the
+# 30-day window walks ~40k rows per target. The counts and the sort now happen
+# inside SQLite (C, via the (target_id, timestamp) index), and the finished
+# summary is cached briefly - these numbers move by one check per minute, so
+# recomputing them on every poll bought nothing.
+_series_stats_cache = {}
+SERIES_STATS_CACHE_SECONDS = 60
 
-    total = len(rows)
+
+def _series_stats(conn, table, value_col, target_id, cutoff):
+    key = (table, target_id, cutoff[:16])  # cutoff to the minute
+    hit = _series_stats_cache.get(key)
+    if hit and time.monotonic() - hit[0] < SERIES_STATS_CACHE_SECONDS:
+        return hit[1]
+
+    total, up = conn.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(ok), 0) FROM {table} "
+        "WHERE target_id = ? AND timestamp >= ?", (target_id, cutoff)
+    ).fetchone()
     if not total:
         return {"checks": 0, "uptime_pct": None, "up": 0, "down": 0,
                 "avg_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
 
-    up = sum(1 for r in rows if r["ok"])
     # Latency is only meaningful for checks that actually got a response.
-    times = sorted(r["response_ms"] for r in rows if r["ok"] and r["response_ms"] is not None)
+    # Single column, already sorted by SQLite: percentiles are then plain
+    # list indexing instead of a Python sort over Row objects.
+    times = [t for (t,) in conn.execute(
+        f"SELECT {value_col} FROM {table} WHERE target_id = ? AND timestamp >= ? "
+        f"AND ok = 1 AND {value_col} IS NOT NULL ORDER BY {value_col}",
+        (target_id, cutoff)
+    )]
 
     def pct(p):
         if not times:
@@ -1960,16 +2038,26 @@ def get_web_stats(target_id, seconds):
         k = min(int(round((p / 100) * (len(times) - 1))), len(times) - 1)
         return round(times[k], 1)
 
-    return {
-        "checks": total,
-        "up": up,
-        "down": total - up,
-        "uptime_pct": round(up / total * 100, 3),
-        "avg_ms": round(sum(times) / len(times), 1) if times else None,
-        "p50_ms": pct(50),
-        "p95_ms": pct(95),
-        "max_ms": round(times[-1], 1) if times else None,
-    }
+    stats = {"checks": total, "up": up, "down": total - up,
+             "uptime_pct": round(up / total * 100, 3),
+             "avg_ms": round(sum(times) / len(times), 1) if times else None,
+             "p50_ms": pct(50), "p95_ms": pct(95),
+             "max_ms": round(times[-1], 1) if times else None}
+    if len(_series_stats_cache) > 512:  # windows x targets is small; be safe anyway
+        _series_stats_cache.clear()
+    _series_stats_cache[key] = (time.monotonic(), stats)
+    return stats
+
+
+def get_web_stats(target_id, seconds):
+    """Uptime and latency summary over a window. Computed from the checks
+    already stored, so no extra polling is involved. Latency figures only
+    count checks that actually got a response."""
+    cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+    conn = db()
+    stats = _series_stats(conn, "web_checks", "response_ms", target_id, cutoff)
+    conn.close()
+    return stats
 
 
 def trim_web_checks():
@@ -1978,6 +2066,9 @@ def trim_web_checks():
     conn.execute("DELETE FROM web_checks WHERE timestamp < ?", (cutoff,))
     conn.commit()
     conn.close()
+
+
+_web_trim_counter = [0]
 
 
 def web_check_loop():
@@ -2011,7 +2102,10 @@ def web_check_loop():
                 maybe_alert_web(fresh, fresh["health"], get_subscriptions_for_web(tid), result)
             except Exception as e:
                 logger.error(f"web check failed for {target['name']}: {e}")
-        trim_web_checks()
+        _web_trim_counter[0] += 1
+        if _web_trim_counter[0] >= max(1, 3600 // WEB_CHECK_INTERVAL_SECONDS):
+            _web_trim_counter[0] = 0
+            trim_web_checks()
         time.sleep(WEB_CHECK_INTERVAL_SECONDS)
 
 
@@ -2071,29 +2165,9 @@ def get_ip_history(target_id, seconds=None, limit=200):
 def get_ip_stats(target_id, seconds):
     cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
     conn = db()
-    rows = conn.execute(
-        "SELECT ok, latency_ms FROM ip_checks WHERE target_id = ? AND timestamp >= ?",
-        (target_id, cutoff)
-    ).fetchall()
+    stats = _series_stats(conn, "ip_checks", "latency_ms", target_id, cutoff)
     conn.close()
-    total = len(rows)
-    if not total:
-        return {"checks": 0, "uptime_pct": None, "up": 0, "down": 0,
-                "avg_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
-    up = sum(1 for r in rows if r["ok"])
-    times = sorted(r["latency_ms"] for r in rows if r["ok"] and r["latency_ms"] is not None)
-
-    def pct(p):
-        if not times:
-            return None
-        k = min(int(round((p / 100) * (len(times) - 1))), len(times) - 1)
-        return round(times[k], 1)
-
-    return {"checks": total, "up": up, "down": total - up,
-            "uptime_pct": round(up / total * 100, 3),
-            "avg_ms": round(sum(times) / len(times), 1) if times else None,
-            "p50_ms": pct(50), "p95_ms": pct(95),
-            "max_ms": round(times[-1], 1) if times else None}
+    return stats
 
 
 def _ping_once(host, timeout_s=3):
@@ -2262,6 +2336,9 @@ def trim_ip_checks():
     conn.close()
 
 
+_ip_trim_counter = [0]
+
+
 def ip_check_loop():
     while True:
         for target in get_ip_targets():
@@ -2288,7 +2365,10 @@ def ip_check_loop():
                 maybe_alert_ip(fresh, fresh["health"], get_subscriptions_for_ip(tid), result)
             except Exception as e:
                 logger.error(f"ip check failed for {target['name']}: {e}")
-        trim_ip_checks()
+        _ip_trim_counter[0] += 1
+        if _ip_trim_counter[0] >= max(1, 3600 // IP_CHECK_INTERVAL_SECONDS):
+            _ip_trim_counter[0] = 0
+            trim_ip_checks()
         time.sleep(IP_CHECK_INTERVAL_SECONDS)
 
 
@@ -2296,13 +2376,19 @@ def ip_check_loop():
 # Background scraper thread (this is your "Prometheus scrape loop")
 # Loops over every configured instance each cycle.
 # ---------------------------------------------------------------------------
+# One session for the scraper's whole life: TCP (and TLS, where used)
+# connections to each exporter are kept alive between cycles instead of being
+# re-established every 10 seconds.
+_scrape_session = requests.Session()
+
+
 def scrape_loop():
     while True:
         for inst in get_instances(include_secrets=True):
             iid = inst["id"]
             try:
                 auth = (inst["auth_username"], inst["auth_password"]) if inst.get("auth_username") else None
-                resp = requests.get(inst["target_url"], timeout=5, auth=auth)
+                resp = _scrape_session.get(inst["target_url"], timeout=5, auth=auth)
                 resp.raise_for_status()
                 prev = _prev_state.get(iid, {})
                 if prev.get("target_url") != inst["target_url"]:
@@ -2322,7 +2408,8 @@ def scrape_loop():
                               iid, inst["name"])
                 if metrics["cpu_percent"] is not None:  # skip first sample (no delta yet)
                     save_metrics(iid, metrics)
-                    logger.info(f"[{inst['name']}] CPU {metrics['cpu_percent']}% | "
+                    _scrape_log = logger.info if SCRAPE_LOG else logger.debug
+                    _scrape_log(f"[{inst['name']}] CPU {metrics['cpu_percent']}% | "
                                 f"MEM {metrics['mem_percent']}% | DISK {metrics['disk_percent']}% | "
                                 f"NET {metrics['net_rx_bps']}/{metrics['net_tx_bps']} B/s | "
                                 f"DISKIO {metrics['disk_read_bps']}/{metrics['disk_write_bps']} B/s")
@@ -2350,6 +2437,9 @@ def scrape_loop():
 # log line per instance either way, so "is it actually working" has a
 # continuous trail instead of only showing up when something changes.
 # ---------------------------------------------------------------------------
+_hb_counter = [0]
+
+
 def heartbeat_loop():
     while True:
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -2377,9 +2467,14 @@ def heartbeat_loop():
                 message = f"Heartbeat: good ({known}/{len(HEALTH_CHECK_DEFS)} health checks known, all passing)"
 
             log_event(level, "heartbeat", message, iid, inst["name"])
-        trim_event_log()
-        trim_audit_log()
-        trim_metrics()
+        # Retention only moves once an hour's worth of rows has expired -
+        # running the DELETEs every heartbeat was pure overhead.
+        _hb_counter[0] += 1
+        if _hb_counter[0] >= max(1, 3600 // HEARTBEAT_INTERVAL_SECONDS):
+            _hb_counter[0] = 0
+            trim_event_log()
+            trim_audit_log()
+            trim_metrics()
 
 
 # ---------------------------------------------------------------------------
@@ -2510,6 +2605,18 @@ def api_instances_delete(instance_id):
     log_audit("instance.delete", target=doomed["name"] if doomed else f"id={instance_id}",
               details="instance and all of its history removed")
     return jsonify({"ok": True})
+
+
+@app.route("/api/metrics/latest-all")
+def api_latest_all():
+    """Latest sample for every instance in one round trip - the overview grid
+    was issuing one request per instance per poll, which on a small server
+    means N gunicorn wakeups every 10 seconds for data one query can carry."""
+    conn = db()
+    ids = [r["id"] for r in conn.execute("SELECT id FROM instances").fetchall()]
+    out = {str(iid): get_latest(iid, conn=conn) for iid in ids}
+    conn.close()
+    return jsonify(out)
 
 
 @app.route("/api/metrics/latest")

@@ -1570,13 +1570,12 @@ let overviewMetrics = {};
 async function loadOverviewMetrics() {
   if (!document.getElementById('view-main').classList.contains('active')) return;
   if (mainType !== 'vps' || mainTargetId !== null) return;
-  const results = await Promise.all(instances.map(async i => {
-    try {
-      const r = await apiFetch('/api/metrics/latest?instance_id=' + i.id);
-      return [i.id, await r.json()];
-    } catch (e) { return [i.id, null]; }
-  }));
-  overviewMetrics = Object.fromEntries(results.filter(([, v]) => v).map(([k, v]) => [k, v]));
+  try {
+    const r = await apiFetch('/api/metrics/latest-all');
+    const all = await r.json();
+    overviewMetrics = Object.fromEntries(
+      Object.entries(all).filter(([, v]) => v));
+  } catch (e) { /* keep whatever we had */ }
   renderOverview();
 }
 
