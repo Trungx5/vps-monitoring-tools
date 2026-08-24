@@ -171,6 +171,8 @@
     vertical-align: middle;
     background: rgba(139,145,163,0.15); color: var(--muted); border: 1px solid var(--border);
   }
+  /* Which exporter answered - detected from the scrape, not configured. */
+  .os-badge { background: rgba(91,141,239,0.12); color: var(--accent); border-color: rgba(91,141,239,0.35); }
   .chart-card {
     background: var(--card);
     border: 1px solid var(--border);
@@ -601,16 +603,21 @@
               <input type="text" id="newInstName" placeholder="e.g. Production API" required>
             </div>
             <div class="field">
-              <label>node_exporter URL</label>
+              <label>Exporter URL</label>
               <input type="text" id="newInstUrl" placeholder="http://1.2.3.4:9100/metrics" required>
+              <div class="stat-sub" style="margin-top:6px;">
+                Linux: <code>node_exporter</code>, port 9100 &mdash; Windows: <code>windows_exporter</code>,
+                port 9182. Which one is running is detected from the first scrape;
+                there is nothing to pick here.
+              </div>
             </div>
             <div class="field">
               <label>Basic Auth username <span style="color:var(--muted);">(optional)</span></label>
-              <input type="text" id="newInstAuthUser" placeholder="leave blank if node_exporter has no auth" autocomplete="off">
+              <input type="text" id="newInstAuthUser" placeholder="leave blank if the exporter has no auth" autocomplete="off">
             </div>
             <div class="field">
               <label>Basic Auth password <span style="color:var(--muted);" id="newInstAuthPassHint">(optional)</span></label>
-              <input type="password" id="newInstAuthPass" placeholder="leave blank if node_exporter has no auth" autocomplete="new-password">
+              <input type="password" id="newInstAuthPass" placeholder="leave blank if the exporter has no auth" autocomplete="new-password">
             </div>
             <button type="submit" class="btn" id="instFormSubmitBtn">Add Instance</button>
             <button type="button" class="btn" id="instFormCancelBtn" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
@@ -621,8 +628,8 @@
     
       <div class="bulk-box">
         <h3 style="font-size:14px; margin:0 0 6px;">Add several at once</h3>
-        <div class="bulk-hint">One per line: <code>Name, http://ip:9100</code>. The <code>/metrics</code> path is added for you. Lines that already exist are skipped.</div>
-        <textarea id="bulkVpsInput" placeholder="Web 1, http://10.0.0.5:9100&#10;DB 1, http://10.0.0.6:9100"></textarea>
+        <div class="bulk-hint">One per line: <code>Name, http://ip:9100</code> (Linux) or <code>Name, http://ip:9182</code> (Windows). The <code>/metrics</code> path is added for you. Lines that already exist are skipped.</div>
+        <textarea id="bulkVpsInput" placeholder="Web 1, http://10.0.0.5:9100&#10;DB 1, http://10.0.0.6:9100&#10;Win App, http://10.0.0.7:9182"></textarea>
         <button type="button" class="btn" id="bulkVpsBtn" style="margin-top:10px;">Add All</button>
         <div class="bulk-result" id="bulkVpsResult"></div>
       </div>
@@ -643,9 +650,11 @@
         <div class="stat-sub" style="max-width:560px;">
           Pass/fail checks evaluated every scrape, separate from the Warn/Critical
           thresholds. A check shows "Unknown" when there isn't enough history yet or
-          this node_exporter build doesn't expose that metric. If an alert email is
-          set (Alerts panel), you'll get one whenever any check flips from passing
-          to failing, or back.
+          this exporter build doesn't expose that metric. On Windows, "Root filesystem
+          writable" and "Network interfaces up" are always Unknown &mdash; windows_exporter
+          publishes no equivalent, and guessing at them would mean false alerts. If an
+          alert email is set (Alerts panel), you'll get one whenever any check flips
+          from passing to failing, or back.
         </div>
     </div>
   </div>
@@ -1286,7 +1295,7 @@ function instanceSeverityPillHtml(inst) {
 }
 
 const HEALTH_LABELS = {
-  reachable: ['Host reachable', 'The dashboard successfully scraped node_exporter on the last cycle.'],
+  reachable: ['Host reachable', 'The dashboard successfully scraped the exporter on the last cycle.'],
   net_ifaces: ['Network interfaces up', 'All non-loopback network interfaces report as up.'],
   fs_writable: ['Root filesystem writable', "The root filesystem isn't mounted read-only - a common sign of disk corruption."],
   load: ['System load normal', 'The 1-minute load average is within a normal range for this many CPU cores.'],
@@ -1294,6 +1303,38 @@ const HEALTH_LABELS = {
   reboot: ['No unexpected reboot', 'Uptime is continuous since the last check - no unplanned restart detected.'],
   traffic: ['No traffic anomaly', 'Current bandwidth is not a large spike versus its recent baseline - a rough signal for things like a DDoS or scraping attack.'],
 };
+
+// Four checks read a different underlying metric on Windows, and two have no
+// Windows equivalent at all. Same pass/fail meaning either way - only the
+// explanation under each row changes, so it describes what was actually
+// measured rather than a Linux concept the box doesn't have.
+const HEALTH_LABELS_WINDOWS = {
+  net_ifaces: ['Network interfaces up', 'windows_exporter publishes no per-NIC link state, so this cannot be checked on Windows.'],
+  fs_writable: ['System drive writable', 'Windows has no read-only-filesystem flag to read, so this cannot be checked on Windows.'],
+  load: ['System load normal', 'The processor queue length - threads waiting on a CPU - is within a normal range for this many cores.'],
+  swap: ['Pagefile not exhausted', "Pagefile usage is below 90%, so the system isn't thrashing."],
+  reboot: ['No unexpected reboot', 'Last boot time is unchanged since the previous check - no unplanned restart detected.'],
+};
+
+// Linux reports a load average; Windows reports the processor queue length.
+// The CPU card shows whichever the selected host actually sent, under its own
+// name, so the number isn't mistaken for the other one.
+function loadLabel() {
+  const inst = instances.find(i => i.id === currentInstanceId);
+  return (inst && inst.os_type === 'windows') ? 'CPU queue' : 'load1';
+}
+
+function healthLabelFor(key, osType) {
+  return (osType === 'windows' && HEALTH_LABELS_WINDOWS[key]) || HEALTH_LABELS[key];
+}
+
+// Detected from the scrape rather than configured, so it's only shown once
+// an instance has actually reported in.
+function osBadgeHtml(inst) {
+  if (!inst || !inst.os_label) return '';
+  return ` <span class="auth-badge os-badge" title="Detected from the exporter's metrics">`
+       + `${escapeHtml(inst.os_label)}</span>`;
+}
 
 function healthFailingCount(inst) {
   if (!inst || !inst.health) return 0;
@@ -1306,8 +1347,8 @@ function healthSummaryHtml(inst) {
   return `<div class="status-line" style="color:var(--bad);"><span class="status-dot" style="background:var(--bad);"></span>${failing} health check${failing > 1 ? 's' : ''} failing</div>`;
 }
 
-function healthRowHtml(key, val) {
-  const [label, desc] = HEALTH_LABELS[key];
+function healthRowHtml(key, val, osType) {
+  const [label, desc] = healthLabelFor(key, osType);
   let icon, color, text;
   if (val === true) { icon = 'OK'; color = 'var(--ok)'; text = 'OK'; }
   else if (val === false) { icon = 'X'; color = 'var(--bad)'; text = 'FAILING'; }
@@ -1329,7 +1370,8 @@ function renderHealthChecks() {
   const list = document.getElementById('healthChecksList');
   if (!inst) { list.innerHTML = ''; return; }
   const health = (inst.health) || {};
-  list.innerHTML = Object.keys(HEALTH_LABELS).map(key => healthRowHtml(key, health[key])).join('');
+  list.innerHTML = Object.keys(HEALTH_LABELS)
+    .map(key => healthRowHtml(key, health[key], inst.os_type)).join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,6 +1502,7 @@ function renderDetailHeader() {
   if (!inst) return;
   document.getElementById('detailName').innerHTML =
     escapeHtml(inst.name)
+    + osBadgeHtml(inst)
     + (inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : '')
     + instanceSeverityPillHtml(inst);
   document.getElementById('detailInfo').textContent =
@@ -1502,7 +1545,7 @@ function renderOverview() {
     const pct = v => (v === null || v === undefined) ? '--' : v + '%';
 
     return `<div class="overview-card ${cls}" data-id="${inst.id}">
-      <div class="overview-name">${escapeHtml(inst.name)}${instanceSeverityPillHtml(inst)}</div>
+      <div class="overview-name">${escapeHtml(inst.name)}${osBadgeHtml(inst)}${instanceSeverityPillHtml(inst)}</div>
       <div class="overview-sub">${escapeHtml(inst.target_url)}</div>
       <div class="overview-metrics">
         ${metric('CPU', down ? '--' : pct(m.cpu_percent))}
@@ -1573,7 +1616,7 @@ function instanceRowHtml(inst, selected, withDelete, withEdit) {
   return `
     <div class="instance-row ${selected ? 'selected' : ''}" data-id="${inst.id}">
       <div>
-        <div class="name">${escapeHtml(inst.name)}${inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
+        <div class="name">${escapeHtml(inst.name)}${osBadgeHtml(inst)}${inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : ''}${instanceSeverityPillHtml(inst)}</div>
         <div class="url">${escapeHtml(inst.target_url)}</div>
         ${statusLineHtml(inst)}
         ${healthSummaryHtml(inst)}
@@ -2723,7 +2766,7 @@ function blankStats(errorMessage) {
   document.getElementById('statusDot').style.background = '#e0524e';
 
   document.getElementById('cpuValue').textContent = '--';
-  document.getElementById('loadValue').textContent = 'load1: --';
+  document.getElementById('loadValue').textContent = loadLabel() + ': --';
   document.getElementById('memValue').textContent = '--';
   document.getElementById('memSub').textContent = '--';
   document.getElementById('diskValue').textContent = '--';
@@ -2766,7 +2809,8 @@ async function refreshLatest() {
     document.getElementById('scrapeErrorBanner').style.display = 'none';
 
     document.getElementById('cpuValue').textContent = m.cpu_percent + '%';
-    document.getElementById('loadValue').textContent = 'load1: ' + m.load1;
+    document.getElementById('loadValue').textContent =
+      loadLabel() + ': ' + (m.load1 === null || m.load1 === undefined ? '--' : m.load1);
     setSeverityClass('card-cpu', severityFor(m.cpu_percent, thresholds.cpu_warn, thresholds.cpu_crit));
 
     document.getElementById('memValue').textContent = m.mem_percent + '%';

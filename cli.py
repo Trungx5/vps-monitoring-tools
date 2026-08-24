@@ -109,10 +109,11 @@ def cmd_status(args):
 # ---------------------------------------------------------------------------
 def cmd_instance_list(args):
     rows = [[i["id"], i["name"], i["target_url"],
+             i.get("os_label") or "-",
              "yes" if i.get("has_auth") else "no",
              i.get("last_status") or "-"]
             for i in app.get_instances()]
-    table(["ID", "NAME", "URL", "AUTH", "SCRAPE"], rows)
+    table(["ID", "NAME", "URL", "OS", "AUTH", "SCRAPE"], rows)
 
 
 def cmd_instance_add(args):
@@ -165,10 +166,12 @@ def cmd_instance_edit(args):
         auth_user = args.auth_user
         auth_pass = args.auth_pass or getpass.getpass(f"Basic Auth password for {auth_user}: ")
 
+    os_type = row["os_type"] if url == row["target_url"] else None
+
     try:
         conn.execute(
-            "UPDATE instances SET name = ?, target_url = ?, auth_username = ?, auth_password = ? "
-            "WHERE id = ?", (name, url, auth_user, auth_pass, inst["id"])
+            "UPDATE instances SET name = ?, target_url = ?, auth_username = ?, auth_password = ?, "
+            "os_type = ? WHERE id = ?", (name, url, auth_user, auth_pass, os_type, inst["id"])
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -707,8 +710,10 @@ def build_parser():
 
     p = inst_sub.add_parser("add", help="add an instance")
     p.add_argument("--name", required=True)
-    p.add_argument("--url", required=True, help="node_exporter URL, e.g. http://10.0.0.5:9100")
-    p.add_argument("--auth-user", dest="auth_user", help="Basic Auth username, if node_exporter requires one")
+    p.add_argument("--url", required=True,
+                   help="exporter URL - node_exporter on Linux (9100) or windows_exporter on Windows (9182), "
+                        "e.g. http://10.0.0.5:9100")
+    p.add_argument("--auth-user", dest="auth_user", help="Basic Auth username, if the exporter requires one")
     p.add_argument("--auth-pass", dest="auth_pass", help="Basic Auth password (prompted if omitted)")
     p.set_defaults(func=cmd_instance_add)
 

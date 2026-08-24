@@ -99,6 +99,15 @@ SMTP_USER = os.environ.get("SMTP_USER")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", SMTP_USER)
 
+# Which agent is on the other end of a scrape. Detected from the payload
+# rather than configured per instance - see detect_os_type().
+OS_LINUX = "linux"
+OS_WINDOWS = "windows"
+OS_LABELS = {OS_LINUX: "Linux", OS_WINDOWS: "Windows"}
+# Windows has no "/" to measure, so disk % is reported for the system drive.
+# Overridable for the rare box that boots from something other than C:.
+WINDOWS_SYSTEM_VOLUME = os.environ.get("WINDOWS_SYSTEM_VOLUME", "C:")
+
 # Metrics that get a Good/Warn/Critical evaluation, and how to read each
 # one's current value off a `metrics` row.
 METRIC_DEFS = {
@@ -115,7 +124,8 @@ SEVERITY_RANK = {"good": 0, "warn": 1, "critical": 2}
 # Pass/fail health checklist - the "is this box actually okay" questions an
 # enterprise monitoring tool asks alongside the numeric gauges above. Each
 # evaluates to True (pass), False (fail), or None (not enough data / metric
-# not exposed by this node_exporter build).
+# not exposed by this exporter build). Windows hosts report None for the two
+# checks that have no Windows counterpart - see _gauges_windows().
 HEALTH_CHECK_DEFS = {
     "reachable": "Host reachable",
     "net_ifaces": "Network interfaces up",
@@ -125,8 +135,11 @@ HEALTH_CHECK_DEFS = {
     "reboot": "No unexpected reboot",
     "traffic": "No traffic anomaly",
 }
-LOAD_WARN_MULTIPLIER = 2.0     # load1 > this * cpu_count = fail
-SWAP_WARN_PERCENT = 90.0       # swap used % >= this = fail
+LOAD_WARN_MULTIPLIER = 2.0     # load1 > this * cpu_count = fail. On Windows the
+                               # same rule reads the processor queue length, where
+                               # "more than 2 waiting threads per core" is the
+                               # equivalent rule of thumb.
+SWAP_WARN_PERCENT = 90.0       # swap (Windows: pagefile) used % >= this = fail
 TRAFFIC_ANOMALY_MULTIPLIER = 5.0     # current bandwidth > this * recent baseline = fail
 TRAFFIC_ANOMALY_MIN_SAMPLES = 5      # need this many history rows to trust a baseline
 TRAFFIC_ANOMALY_FLOOR_BPS = 5000     # ignore spikes below this - idle noise, not an anomaly
@@ -568,7 +581,8 @@ def _init_db_once():
             last_error TEXT,
             last_checked_at TEXT,
             auth_username TEXT,
-            auth_password TEXT
+            auth_password TEXT,
+            os_type TEXT
         )
     """)
 
@@ -786,6 +800,8 @@ def _init_db_once():
         conn.execute("ALTER TABLE instances ADD COLUMN auth_username TEXT")
     if "auth_password" not in inst_cols:
         conn.execute("ALTER TABLE instances ADD COLUMN auth_password TEXT")
+    if "os_type" not in inst_cols:
+        conn.execute("ALTER TABLE instances ADD COLUMN os_type TEXT")
 
     sub_cols = [r[1] for r in conn.execute("PRAGMA table_info(alert_subscriptions)").fetchall()]
     if "monitor_type" not in sub_cols:
@@ -902,6 +918,7 @@ def get_instances(include_secrets=False):
     instances = [dict(r) for r in rows]
     for inst in instances:
         inst["has_auth"] = bool(inst.get("auth_username"))
+        inst["os_label"] = OS_LABELS.get(inst.get("os_type"))
         if not include_secrets:
             inst.pop("auth_password", None)
         latest = get_latest(inst["id"])
@@ -1171,30 +1188,120 @@ def parse_metrics_text(text):
 _prev_state = {}
 
 
-def compute_rates(parsed, prev, now_mono):
-    cpu_lines = parsed.get("node_cpu_seconds_total", [])
+def _scalar_reader(parsed):
+    """Returns scalar(name, label_filter) / first(*names) / total(*names)
+    helpers over one parsed payload. `first` exists because windows_exporter
+    has moved metrics between releases (the `os` collector's memory and
+    paging gauges moved to the `memory` and `pagefile` collectors), so a
+    single reading often has to be looked for under two or three names."""
+    def scalar(name, label_filter=None):
+        for labels, value in parsed.get(name, []):
+            if label_filter is None or all(labels.get(k) == v for k, v in label_filter.items()):
+                return value
+        return None
+
+    def first(*names, label_filter=None):
+        for name in names:
+            value = scalar(name, label_filter)
+            if value is not None:
+                return value
+        return None
+
+    def total(*names):
+        """Sum every series of the first name that's present - some of these
+        are per-pagefile on newer exporter builds, and a bare scalar would
+        silently read only the first one."""
+        for name in names:
+            rows = parsed.get(name)
+            if rows:
+                return sum(v for _, v in rows)
+        return None
+
+    return scalar, first, total
+
+
+def detect_os_type(parsed):
+    """node_exporter and windows_exporter publish disjoint metric namespaces
+    (`node_*` vs `windows_*`), so the scrape itself says which agent is on the
+    other end. That beats a per-instance OS setting the user has to pick
+    correctly - and keeps working if a host is rebuilt onto the other OS."""
+    if any(name.startswith("windows_") for name in parsed):
+        return OS_WINDOWS
+    if any(name.startswith("node_") for name in parsed):
+        return OS_LINUX
+    return None
+
+
+# Windows NICs that exist in every install and would only add noise to a
+# bandwidth total, the way `lo` does on Linux.
+_WINDOWS_VIRTUAL_NIC_RE = re.compile(r"loopback|isatap|teredo|pseudo", re.IGNORECASE)
+
+
+def _counters_linux(parsed):
+    """The cumulative counters every per-second rate is derived from."""
     totals, idles = {}, {}
-    for labels, value in cpu_lines:
+    for labels, value in parsed.get("node_cpu_seconds_total", []):
         cpu = labels.get("cpu")
         totals[cpu] = totals.get(cpu, 0) + value
         if labels.get("mode") == "idle":
             idles[cpu] = idles.get(cpu, 0) + value
-    total_sum = sum(totals.values())
-    idle_sum = sum(idles.values())
-    cpu_count = len(totals) or None
 
-    net_rx = sum(v for l, v in parsed.get("node_network_receive_bytes_total", [])
-                 if l.get("device") != "lo")
-    net_tx = sum(v for l, v in parsed.get("node_network_transmit_bytes_total", [])
-                 if l.get("device") != "lo")
+    return {
+        "cpu_total": sum(totals.values()),
+        "cpu_idle": sum(idles.values()),
+        "cpu_count": len(totals) or None,
+        "net_rx": sum(v for l, v in parsed.get("node_network_receive_bytes_total", [])
+                      if l.get("device") != "lo"),
+        "net_tx": sum(v for l, v in parsed.get("node_network_transmit_bytes_total", [])
+                      if l.get("device") != "lo"),
+        "disk_read": sum(v for l, v in parsed.get("node_disk_read_bytes_total", [])),
+        "disk_write": sum(v for l, v in parsed.get("node_disk_written_bytes_total", [])),
+    }
 
-    disk_read = sum(v for l, v in parsed.get("node_disk_read_bytes_total", []))
-    disk_write = sum(v for l, v in parsed.get("node_disk_written_bytes_total", []))
 
+def _counters_windows(parsed):
+    """The same counters, read off windows_exporter. The shapes line up
+    closely: windows_cpu_time_total is node_cpu_seconds_total with a `core`
+    label instead of `cpu`, and disk I/O is per logical volume rather than
+    per physical device."""
+    totals, idles = {}, {}
+    for labels, value in parsed.get("windows_cpu_time_total", []):
+        core = labels.get("core")
+        totals[core] = totals.get(core, 0) + value
+        if labels.get("mode") == "idle":
+            idles[core] = idles.get(core, 0) + value
+
+    def net(name):
+        return sum(v for l, v in parsed.get(name, [])
+                   if not _WINDOWS_VIRTUAL_NIC_RE.search(l.get("nic", "")))
+
+    def disk(name):
+        # Some builds publish a "_Total" pseudo-volume alongside the real
+        # ones; counting it would double every byte.
+        return sum(v for l, v in parsed.get(name, []) if l.get("volume") != "_Total")
+
+    _scalar, first, _total = _scalar_reader(parsed)
+    cpu_count = len(totals) or first("windows_cs_logical_processors")
+
+    return {
+        "cpu_total": sum(totals.values()),
+        "cpu_idle": sum(idles.values()),
+        "cpu_count": int(cpu_count) if cpu_count else None,
+        "net_rx": net("windows_net_bytes_received_total"),
+        "net_tx": net("windows_net_bytes_sent_total"),
+        "disk_read": disk("windows_logical_disk_read_bytes_total"),
+        "disk_write": disk("windows_logical_disk_write_bytes_total"),
+    }
+
+
+def compute_rates(counters, prev, now_mono):
+    """Turns two consecutive counter readings into usage % and bytes/sec.
+    OS-agnostic - `counters` has already been normalised by whichever
+    per-OS reader above produced it."""
     cpu_percent = None
     if prev.get("cpu_total") is not None:
-        d_total = total_sum - prev["cpu_total"]
-        d_idle = idle_sum - prev["cpu_idle"]
+        d_total = counters["cpu_total"] - prev["cpu_total"]
+        d_idle = counters["cpu_idle"] - prev["cpu_idle"]
         if d_total > 0:
             cpu_percent = round((1 - d_idle / d_total) * 100, 2)
 
@@ -1205,67 +1312,136 @@ def compute_rates(parsed, prev, now_mono):
         return round(d / dt, 1) if d >= 0 else None
 
     dt = (now_mono - prev["net_time"]) if prev.get("net_time") is not None else None
-    net_rx_bps = rate(net_rx, prev.get("net_rx"), dt)
-    net_tx_bps = rate(net_tx, prev.get("net_tx"), dt)
-    disk_read_bps = rate(disk_read, prev.get("disk_read"), dt)
-    disk_write_bps = rate(disk_write, prev.get("disk_write"), dt)
+    net_rx, net_tx = counters["net_rx"], counters["net_tx"]
 
     new_state = {
-        "cpu_total": total_sum, "cpu_idle": idle_sum,
+        "cpu_total": counters["cpu_total"], "cpu_idle": counters["cpu_idle"],
         "net_rx": net_rx, "net_tx": net_tx,
-        "disk_read": disk_read, "disk_write": disk_write,
+        "disk_read": counters["disk_read"], "disk_write": counters["disk_write"],
         "net_time": now_mono,
     }
     return {
         "cpu_percent": cpu_percent,
-        "cpu_count": cpu_count,
+        "cpu_count": counters["cpu_count"],
         "net_rx": net_rx, "net_tx": net_tx,
-        "net_rx_bps": net_rx_bps, "net_tx_bps": net_tx_bps,
-        "disk_read_bps": disk_read_bps, "disk_write_bps": disk_write_bps,
+        "net_rx_bps": rate(net_rx, prev.get("net_rx"), dt),
+        "net_tx_bps": rate(net_tx, prev.get("net_tx"), dt),
+        "disk_read_bps": rate(counters["disk_read"], prev.get("disk_read"), dt),
+        "disk_write_bps": rate(counters["disk_write"], prev.get("disk_write"), dt),
     }, new_state
 
 
+def _gauges_linux(parsed):
+    """The point-in-time readings: memory, the root filesystem, and the
+    inputs to the health checklist."""
+    scalar, _first, _total = _scalar_reader(parsed)
+
+    fs_readonly = scalar("node_filesystem_readonly", {"mountpoint": "/"})
+    non_loopback = [v for l, v in parsed.get("node_network_up", []) if l.get("device") != "lo"]
+
+    return {
+        "mem_total": scalar("node_memory_MemTotal_bytes") or 0,
+        "mem_avail": scalar("node_memory_MemAvailable_bytes") or 0,
+        "disk_size": scalar("node_filesystem_size_bytes", {"mountpoint": "/"}) or 0,
+        "disk_avail": scalar("node_filesystem_avail_bytes", {"mountpoint": "/"}) or 0,
+        "swap_total": scalar("node_memory_SwapTotal_bytes"),
+        "swap_free": scalar("node_memory_SwapFree_bytes"),
+        "fs_readonly": int(fs_readonly) if fs_readonly is not None else None,
+        "net_ifaces_down": sum(1 for v in non_loopback if v == 0) if non_loopback else None,
+        "boot_time": scalar("node_boot_time_seconds"),
+        "load1": scalar("node_load1"),
+    }
+
+
+def _windows_system_volume(parsed):
+    """Windows has no single `/`. Prefer the configured system drive, and if
+    the exporter doesn't report it (a box that boots from D:, or a drive
+    letter excluded in the exporter's own config) fall back to the largest
+    real volume rather than reporting no disk at all."""
+    sizes = {}
+    for labels, value in parsed.get("windows_logical_disk_size_bytes", []):
+        volume = labels.get("volume")
+        if volume and volume != "_Total":
+            sizes[volume] = value
+    if WINDOWS_SYSTEM_VOLUME in sizes:
+        return WINDOWS_SYSTEM_VOLUME
+    lettered = {k: v for k, v in sizes.items() if k.endswith(":")}
+    pool = lettered or sizes
+    return max(pool, key=pool.get) if pool else None
+
+
+def _gauges_windows(parsed):
+    """windows_exporter equivalents of the readings above.
+
+    Two health checks have no honest Windows counterpart and come back
+    Unknown rather than guessed at: there is no read-only-filesystem flag,
+    and the net collector exposes no per-NIC link state. The other five map
+    cleanly - notably the processor queue length, which is the Windows
+    analogue of load average (threads waiting on a CPU), so the same
+    "more than 2 per core" rule of thumb applies to both."""
+    _scalar, first, total = _scalar_reader(parsed)
+
+    volume = _windows_system_volume(parsed)
+    vol_filter = {"volume": volume} if volume else None
+
+    return {
+        "mem_total": first("windows_memory_physical_total_bytes",
+                           "windows_cs_physical_memory_bytes") or 0,
+        "mem_avail": first("windows_memory_available_bytes",
+                           "windows_memory_physical_free_bytes",
+                           "windows_os_physical_memory_free_bytes") or 0,
+        "disk_size": first("windows_logical_disk_size_bytes", label_filter=vol_filter) or 0,
+        "disk_avail": first("windows_logical_disk_free_bytes", label_filter=vol_filter) or 0,
+        # The pagefile is Windows' swap. Newer builds break it out per file,
+        # so these are summed rather than read as a single series.
+        "swap_total": total("windows_pagefile_limit_bytes", "windows_os_paging_limit_bytes"),
+        "swap_free": total("windows_pagefile_free_bytes", "windows_os_paging_free_bytes"),
+        "fs_readonly": None,
+        "net_ifaces_down": None,
+        "boot_time": first("windows_system_system_up_time"),
+        "load1": first("windows_system_processor_queue_length"),
+    }
+
+
 def extract_metrics(text, prev, now_mono):
+    """Turns one scrape into a metrics row. Works against node_exporter or
+    windows_exporter - which one is on the other end is read off the payload,
+    then normalised into the same shape so everything downstream (storage,
+    thresholds, health checks, alerts, charts) stays OS-agnostic."""
     parsed = parse_metrics_text(text)
+    os_type = detect_os_type(parsed)
+    if os_type is None:
+        # Previously this scraped "successfully" and then sat at "waiting for
+        # first scrape" forever. Failing loudly points at the actual problem.
+        raise ValueError("no node_exporter or windows_exporter metrics found here - "
+                         "check the URL points at an exporter's /metrics endpoint")
 
-    def scalar(name, label_filter=None):
-        for labels, value in parsed.get(name, []):
-            if label_filter is None or all(labels.get(k) == v for k, v in label_filter.items()):
-                return value
-        return None
+    if os_type == OS_WINDOWS:
+        counters, gauges = _counters_windows(parsed), _gauges_windows(parsed)
+    else:
+        counters, gauges = _counters_linux(parsed), _gauges_linux(parsed)
 
-    mem_total = scalar("node_memory_MemTotal_bytes") or 0
-    mem_avail = scalar("node_memory_MemAvailable_bytes") or 0
+    mem_total, mem_avail = gauges["mem_total"], gauges["mem_avail"]
     mem_used = mem_total - mem_avail
     mem_percent = round((mem_used / mem_total) * 100, 2) if mem_total else None
 
-    disk_size = scalar("node_filesystem_size_bytes", {"mountpoint": "/"}) or 0
-    disk_avail = scalar("node_filesystem_avail_bytes", {"mountpoint": "/"}) or 0
+    disk_size, disk_avail = gauges["disk_size"], gauges["disk_avail"]
     disk_used = disk_size - disk_avail
     disk_percent = round((disk_used / disk_size) * 100, 2) if disk_size else None
 
-    swap_total = scalar("node_memory_SwapTotal_bytes")
-    swap_free = scalar("node_memory_SwapFree_bytes")
+    swap_total, swap_free = gauges["swap_total"], gauges["swap_free"]
     if swap_total:
         swap_percent = round(((swap_total - (swap_free or 0)) / swap_total) * 100, 2)
     elif swap_total == 0:
-        swap_percent = 0.0  # no swap configured - nothing to exhaust
+        swap_percent = 0.0  # no swap / pagefile configured - nothing to exhaust
     else:
         swap_percent = None  # metric not exposed at all
 
-    fs_readonly = scalar("node_filesystem_readonly", {"mountpoint": "/"})
-    fs_readonly = int(fs_readonly) if fs_readonly is not None else None
-
-    iface_up = parsed.get("node_network_up", [])
-    non_loopback = [v for l, v in iface_up if l.get("device") != "lo"]
-    net_ifaces_down = sum(1 for v in non_loopback if v == 0) if non_loopback else None
-
-    boot_time = scalar("node_boot_time_seconds")
-
-    rates, new_state = compute_rates(parsed, prev, now_mono)
+    rates, new_state = compute_rates(counters, prev, now_mono)
 
     metrics = {
         "timestamp": utcnow().isoformat(),
+        "os_type": os_type,
         "cpu_percent": rates["cpu_percent"],
         "cpu_count": rates["cpu_count"],
         "mem_percent": mem_percent,
@@ -1280,13 +1456,23 @@ def extract_metrics(text, prev, now_mono):
         "net_tx_bps": rates["net_tx_bps"],
         "disk_read_bps": rates["disk_read_bps"],
         "disk_write_bps": rates["disk_write_bps"],
-        "load1": scalar("node_load1"),
+        "load1": gauges["load1"],
         "swap_percent": swap_percent,
-        "fs_readonly": fs_readonly,
-        "net_ifaces_down": net_ifaces_down,
-        "boot_time": boot_time,
+        "fs_readonly": gauges["fs_readonly"],
+        "net_ifaces_down": gauges["net_ifaces_down"],
+        "boot_time": gauges["boot_time"],
     }
     return metrics, new_state
+
+
+def set_instance_os_type(instance_id, os_type):
+    """Recorded on the instance so the dashboard can label it without
+    re-scraping. Written only when it changes - normally once, on the first
+    successful scrape after an instance is added."""
+    conn = db()
+    conn.execute("UPDATE instances SET os_type = ? WHERE id = ?", (os_type, instance_id))
+    conn.commit()
+    conn.close()
 
 
 def set_instance_status(instance_id, status, error=None):
@@ -2098,8 +2284,21 @@ def scrape_loop():
                 resp = requests.get(inst["target_url"], timeout=5, auth=auth)
                 resp.raise_for_status()
                 prev = _prev_state.get(iid, {})
+                if prev.get("target_url") != inst["target_url"]:
+                    # Re-pointed at a different endpoint since the last scrape.
+                    # Its counters have nothing to do with the old host's, and
+                    # differencing the two would invent a huge spike (or, across
+                    # a Linux/Windows switch, a meaningless CPU %).
+                    prev = {}
                 metrics, new_state = extract_metrics(resp.text, prev, time.monotonic())
+                new_state["target_url"] = inst["target_url"]
                 _prev_state[iid] = new_state
+                if metrics["os_type"] != inst.get("os_type"):
+                    set_instance_os_type(iid, metrics["os_type"])
+                    inst["os_type"] = metrics["os_type"]
+                    log_event("info", "scrape",
+                              f"Detected {OS_LABELS[metrics['os_type']]} exporter",
+                              iid, inst["name"])
                 if metrics["cpu_percent"] is not None:  # skip first sample (no delta yet)
                     save_metrics(iid, metrics)
                     logger.info(f"[{inst['name']}] CPU {metrics['cpu_percent']}% | "
@@ -2244,10 +2443,16 @@ def api_instances_update(instance_id):
             if new_password:
                 auth_password = new_password
 
+    # A new URL can be a different machine, or the same one rebuilt onto
+    # another OS, so the detected OS no longer applies. The next scrape
+    # re-detects it (and drops its counter baseline - see scrape_loop).
+    os_type = row["os_type"] if url == row["target_url"] else None
+
     try:
         conn.execute(
-            "UPDATE instances SET name = ?, target_url = ?, auth_username = ?, auth_password = ? WHERE id = ?",
-            (name, url, auth_username, auth_password, instance_id)
+            "UPDATE instances SET name = ?, target_url = ?, auth_username = ?, "
+            "auth_password = ?, os_type = ? WHERE id = ?",
+            (name, url, auth_username, auth_password, os_type, instance_id)
         )
         conn.commit()
     except sqlite3.IntegrityError:
