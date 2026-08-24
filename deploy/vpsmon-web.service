@@ -1,6 +1,6 @@
 [Unit]
 Description=VPS Monitor - web dashboard
-After=network.target
+After=network.target vpsmon-scraper.service
 Wants=vpsmon-scraper.service
 
 [Service]
@@ -9,6 +9,10 @@ User=vpsmon
 Group=vpsmon
 WorkingDirectory=/opt/vpsmon/app
 EnvironmentFile=/etc/vpsmon/vpsmon.env
+# The account home (/opt/vpsmon) is read-only under ProtectSystem=strict,
+# so point HOME at the writable data dir - gunicorn and friends drop dot
+# directories there and log errors on every start otherwise.
+Environment=HOME=/opt/vpsmon/data
 
 # Runs once per service start (not per worker), so the database is ready
 # before any worker accepts a request. Add --rotate-sessions here if you want

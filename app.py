@@ -474,7 +474,21 @@ def logout():
 # ---------------------------------------------------------------------------
 # Database (SQLite acts as our mini time-series store)
 # ---------------------------------------------------------------------------
-def init_db():
+def init_db(_attempt=0):
+    """Create or upgrade the schema. Safe to call from several processes at
+    once: on a fresh install the web and scraper services start together and
+    both land here, and switching the journal mode needs a brief exclusive
+    lock, so a loser can see SQLITE_BUSY. Retry rather than crash the service."""
+    try:
+        return _init_db_once()
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e).lower() or _attempt >= 5:
+            raise
+        time.sleep(0.5 * (_attempt + 1))
+        return init_db(_attempt + 1)
+
+
+def _init_db_once():
     conn = db()
     # WAL lets the web workers keep reading while the scraper writes, instead
     # of the two blocking each other on every sample.
@@ -601,10 +615,11 @@ def init_db():
     """)
     conn.commit()
 
-    if conn.execute("SELECT value FROM app_state WHERE key = 'boot_id'").fetchone() is None:
-        conn.execute("INSERT INTO app_state (key, value) VALUES ('boot_id', ?)",
-                     (secrets.token_hex(8),))
-        conn.commit()
+    # INSERT OR IGNORE rather than check-then-insert: two services starting
+    # together can both see the row missing and race to create it.
+    conn.execute("INSERT OR IGNORE INTO app_state (key, value) VALUES ('boot_id', ?)",
+                 (secrets.token_hex(8),))
+    conn.commit()
 
     # --- migrate a pre-multi-instance / pre-severity-tier metrics.db in place ---
     cols = [r[1] for r in conn.execute("PRAGMA table_info(metrics)").fetchall()]
@@ -682,13 +697,16 @@ def init_db():
     # a fresh install on someone else's server should start empty, not
     # pre-pointed at a hard-coded address.
     if DEFAULT_TARGET_URL and conn.execute("SELECT id FROM instances LIMIT 1").fetchone() is None:
-        cur = conn.execute(
-            "INSERT INTO instances (name, target_url, created_at) VALUES (?, ?, ?)",
-            ("Default", DEFAULT_TARGET_URL, utcnow().isoformat())
-        )
-        default_id = cur.lastrowid
-        conn.execute("UPDATE metrics SET instance_id = ? WHERE instance_id IS NULL", (default_id,))
-        conn.commit()
+        try:
+            cur = conn.execute(
+                "INSERT INTO instances (name, target_url, created_at) VALUES (?, ?, ?)",
+                ("Default", DEFAULT_TARGET_URL, utcnow().isoformat())
+            )
+            conn.execute("UPDATE metrics SET instance_id = ? WHERE instance_id IS NULL",
+                         (cur.lastrowid,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            conn.rollback()  # another starting process seeded it first
 
     conn.close()
     bootstrap_admin_user()
@@ -710,7 +728,15 @@ def bootstrap_admin_user():
     if generated:
         password = secrets.token_urlsafe(12)
 
-    create_user(username, password, ROLE_ADMIN)
+    try:
+        create_user(username, password, ROLE_ADMIN)
+    except sqlite3.IntegrityError:
+        # The web and scraper services start at the same time and both call
+        # init_db(). Both can see an empty users table and race to create the
+        # first admin; the loser must not crash, the account exists either way.
+        logger.info(f"First admin {username!r} was created concurrently - nothing to do")
+        return None
+
     log_audit("user.bootstrap", target=username, details="initial admin account",
               username="system", user_id=None, ip=None)
 

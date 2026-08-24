@@ -8,6 +8,10 @@ User=vpsmon
 Group=vpsmon
 WorkingDirectory=/opt/vpsmon/app
 EnvironmentFile=/etc/vpsmon/vpsmon.env
+# The account home (/opt/vpsmon) is read-only under ProtectSystem=strict,
+# so point HOME at the writable data dir - gunicorn and friends drop dot
+# directories there and log errors on every start otherwise.
+Environment=HOME=/opt/vpsmon/data
 
 # Exactly one scraper process, always. Running a second copy would double the
 # load on every monitored machine and send duplicate alert emails.
