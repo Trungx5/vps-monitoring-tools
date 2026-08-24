@@ -30,7 +30,9 @@ import os
 import re
 import secrets
 import smtplib
+import socket
 import sqlite3
+import ssl
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -52,6 +54,12 @@ from werkzeug.security import check_password_hash, generate_password_hash
 DEFAULT_TARGET_URL = os.environ.get("DEFAULT_TARGET_URL", "")
 SCRAPE_INTERVAL_SECONDS = 10
 HEARTBEAT_INTERVAL_SECONDS = 30
+# Websites are checked from the outside and are far less volatile than a
+# server's CPU, so they get a slower cadence - and hammering someone else's
+# site every 10 seconds would be rude at best.
+WEB_CHECK_INTERVAL_SECONDS = int(os.environ.get("WEB_CHECK_INTERVAL_SECONDS", "60"))
+WEB_CHECK_TIMEOUT_SECONDS = 15
+WEB_CHECK_RETENTION_DAYS = 30
 EVENT_LOG_RETENTION_DAYS = 3
 AUDIT_LOG_RETENTION_DAYS = 90
 DB_PATH = os.environ.get("DB_PATH", "metrics.db")
@@ -137,6 +145,32 @@ ALERT_TYPE_LABELS = {
     "reboot": "Unexpected reboot",
     "traffic": "Traffic anomaly (possible attack)",
 }
+
+# Website checks. Kept in their own namespace so a subscription row always
+# says which kind of monitor it belongs to.
+WEB_ALERT_TYPE_LABELS = {
+    "web_down": "Website down / unreachable",
+    "web_slow": "Website slow to respond",
+    "web_status": "Unexpected HTTP status code",
+    "web_cert_expiring": "TLS certificate expiring soon",
+    "web_cert_invalid": "TLS certificate invalid",
+    "web_ip_changed": "Resolved IP address changed",
+    "web_keyword_missing": "Expected text missing from page",
+}
+
+# Pass/fail checks shown per website, mirroring the VPS health checklist.
+WEB_CHECK_DEFS = {
+    "reachable": "Site responding",
+    "status": "Expected HTTP status",
+    "speed": "Response time acceptable",
+    "cert_valid": "TLS certificate valid",
+    "cert_fresh": "TLS certificate not expiring soon",
+    "ip_stable": "Resolved IP unchanged",
+    "keyword": "Expected text present",
+}
+
+WEB_CERT_WARN_DAYS = 21        # cert_fresh fails below this
+WEB_SLOW_MS_DEFAULT = 5000     # speed fails above this unless overridden
 
 app = Flask(__name__)
 # A per-process random fallback is fine for single-process development, but
@@ -613,6 +647,42 @@ def _init_db_once():
             value TEXT NOT NULL
         )
     """)
+
+    # --- website monitoring -------------------------------------------------
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS web_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL UNIQUE,
+            expected_status INTEGER,
+            keyword TEXT,
+            slow_ms INTEGER,
+            cert_warn_days INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            last_status TEXT,
+            last_error TEXT,
+            last_checked_at TEXT,
+            last_ip TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS web_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            ok INTEGER,
+            status_code INTEGER,
+            response_ms REAL,
+            resolved_ip TEXT,
+            cert_days REAL,
+            cert_valid INTEGER,
+            keyword_ok INTEGER,
+            final_url TEXT,
+            error TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_target ON web_checks(target_id, id)")
     conn.commit()
 
     # INSERT OR IGNORE rather than check-then-insert: two services starting
@@ -655,6 +725,12 @@ def _init_db_once():
         conn.execute("ALTER TABLE instances ADD COLUMN auth_username TEXT")
     if "auth_password" not in inst_cols:
         conn.execute("ALTER TABLE instances ADD COLUMN auth_password TEXT")
+
+    sub_cols = [r[1] for r in conn.execute("PRAGMA table_info(alert_subscriptions)").fetchall()]
+    if "monitor_type" not in sub_cols:
+        # Existing rows all predate website monitoring, so they are VPS alerts.
+        conn.execute("ALTER TABLE alert_subscriptions ADD COLUMN monitor_type TEXT NOT NULL DEFAULT 'vps'")
+        conn.commit()
 
     thresh_cols = [r[1] for r in conn.execute("PRAGMA table_info(alert_thresholds)").fetchall()]
     legacy_map = {"cpu_max": "cpu_crit", "mem_max": "mem_crit",
@@ -867,32 +943,63 @@ def get_thresholds(instance_id):
             "diskio_warn": None, "diskio_crit": None}
 
 
+def alert_label_for(alert_type):
+    return ALERT_TYPE_LABELS.get(alert_type) or WEB_ALERT_TYPE_LABELS.get(alert_type) or alert_type
+
+
 def get_subscriptions(instance_id):
+    """VPS subscriptions for one instance."""
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM alert_subscriptions WHERE instance_id = ? ORDER BY id", (instance_id,)
+        "SELECT * FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'vps' ORDER BY id",
+        (instance_id,)
     ).fetchall()
     conn.close()
     subs = [dict(r) for r in rows]
     for s in subs:
-        s["alert_type_label"] = ALERT_TYPE_LABELS.get(s["alert_type"], s["alert_type"])
+        s["alert_type_label"] = alert_label_for(s["alert_type"])
+    return subs
+
+
+def get_subscriptions_for_web(target_id):
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'web' ORDER BY id",
+        (target_id,)
+    ).fetchall()
+    conn.close()
+    subs = [dict(r) for r in rows]
+    for s in subs:
+        s["alert_type_label"] = alert_label_for(s["alert_type"])
     return subs
 
 
 def get_all_subscriptions():
-    """Every subscription across every instance, with the instance's name
-    joined in - the data behind the Alerts page's global recipients table."""
+    """Every subscription of every monitor type, with the target's name resolved.
+    A LEFT JOIN against each table so a row is never dropped just because it
+    points at the other kind of monitor."""
     conn = db()
     rows = conn.execute("""
-        SELECT s.*, i.name AS instance_name, i.target_url AS instance_url
+        SELECT s.*,
+               i.name AS vps_name, i.target_url AS vps_url,
+               w.name AS web_name, w.url AS web_url
         FROM alert_subscriptions s
-        JOIN instances i ON i.id = s.instance_id
+        LEFT JOIN instances   i ON i.id = s.instance_id AND s.monitor_type = 'vps'
+        LEFT JOIN web_targets w ON w.id = s.instance_id AND s.monitor_type = 'web'
         ORDER BY s.id
     """).fetchall()
     conn.close()
-    subs = [dict(r) for r in rows]
-    for s in subs:
-        s["alert_type_label"] = ALERT_TYPE_LABELS.get(s["alert_type"], s["alert_type"])
+    subs = []
+    for r in rows:
+        s = dict(r)
+        is_web = s.get("monitor_type") == "web"
+        s["target_name"] = (s.pop("web_name") if is_web else s.pop("vps_name")) or f"#{s['instance_id']}"
+        s["target_url"] = (s.pop("web_url") if is_web else s.pop("vps_url")) or ""
+        s.pop("web_name", None); s.pop("vps_name", None)
+        s.pop("web_url", None); s.pop("vps_url", None)
+        s["instance_name"] = s["target_name"]          # kept for the existing UI
+        s["alert_type_label"] = alert_label_for(s["alert_type"])
+        subs.append(s)
     return subs
 
 
@@ -1281,6 +1388,299 @@ def maybe_alert(inst, metrics, thresholds, subscriptions):
 
 
 # ---------------------------------------------------------------------------
+# Website monitoring
+#
+# Unlike the VPS side there is no agent on the far end - everything is
+# observed from outside, the same way an ordinary visitor sees the site.
+# ---------------------------------------------------------------------------
+def get_web_targets():
+    conn = db()
+    rows = conn.execute("SELECT * FROM web_targets ORDER BY id").fetchall()
+    conn.close()
+    targets = [dict(r) for r in rows]
+    for t in targets:
+        t["health"] = evaluate_web_health(t, get_web_latest(t["id"]))
+        t["severity"] = {"overall": web_overall_severity(t)}
+    return targets
+
+
+def get_web_target(target_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM web_targets WHERE id = ?", (target_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_web_latest(target_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM web_checks WHERE target_id = ? ORDER BY id DESC LIMIT 1", (target_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_web_history(target_id, seconds=None, limit=200):
+    conn = db()
+    if seconds:
+        cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+        rows = conn.execute(
+            "SELECT * FROM web_checks WHERE target_id = ? AND timestamp >= ? ORDER BY id ASC",
+            (target_id, cutoff)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM web_checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
+            (target_id, limit)
+        ).fetchall()
+        rows = list(reversed(rows))
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def normalize_web_url(url):
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not re.match(r'^https?://', url, re.I):
+        url = "https://" + url          # default to HTTPS, not HTTP
+    return url
+
+
+def _ca_bundle():
+    """Verify against the same CA bundle requests uses. Relying on the OS trust
+    store instead makes cert_valid disagree with the HTTP check on any machine
+    whose root store is behind - which shows up as phantom 'invalid
+    certificate' alerts for sites that are actually fine."""
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return None
+
+
+def _tls_info(hostname, port=443):
+    """(days_until_expiry, is_valid). Falls back to an unverified handshake so
+    an expired or self-signed certificate still reports its dates instead of
+    just failing - that distinction is the whole point of the check."""
+    try:
+        ctx = ssl.create_default_context(cafile=_ca_bundle())
+        with ctx.wrap_socket(socket.create_connection((hostname, port), timeout=10),
+                             server_hostname=hostname) as s:
+            der = s.getpeercert(binary_form=True)
+        valid = True
+    except Exception:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(socket.create_connection((hostname, port), timeout=10),
+                                 server_hostname=hostname) as s:
+                der = s.getpeercert(binary_form=True)
+            valid = False
+        except Exception:
+            return None, None
+    try:
+        from cryptography import x509
+        cert = x509.load_der_x509_certificate(der)
+        days = (cert.not_valid_after_utc.replace(tzinfo=None) - utcnow()).total_seconds() / 86400
+        return round(days, 1), valid
+    except Exception:
+        return None, valid
+
+
+def check_web_target(target):
+    """One pass over a single website. Never raises - a failure is a result."""
+    url = target["url"]
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    result = {"target_id": target["id"], "timestamp": utcnow().isoformat(), "ok": 0,
+              "status_code": None, "response_ms": None, "resolved_ip": None,
+              "cert_days": None, "cert_valid": None, "keyword_ok": None,
+              "final_url": None, "error": None}
+
+    try:
+        result["resolved_ip"] = socket.gethostbyname(host)
+    except Exception as e:
+        result["error"] = f"DNS lookup failed: {e}"
+        return result
+
+    started = time.monotonic()
+    try:
+        resp = requests.get(url, timeout=WEB_CHECK_TIMEOUT_SECONDS, allow_redirects=True,
+                            headers={"User-Agent": "vpsmon-uptime/1.0 (+website monitoring)"})
+        result["response_ms"] = round((time.monotonic() - started) * 1000, 1)
+        result["status_code"] = resp.status_code
+        result["final_url"] = resp.url
+        expected = target.get("expected_status")
+        result["ok"] = 1 if (resp.status_code == expected if expected else resp.status_code < 400) else 0
+        if target.get("keyword"):
+            result["keyword_ok"] = 1 if target["keyword"].lower() in resp.text.lower() else 0
+        if not result["ok"]:
+            result["error"] = f"HTTP {resp.status_code}"
+    except Exception as e:
+        result["response_ms"] = round((time.monotonic() - started) * 1000, 1)
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    if parts.scheme == "https":
+        days, valid = _tls_info(host, parts.port or 443)
+        result["cert_days"] = days
+        result["cert_valid"] = None if valid is None else (1 if valid else 0)
+    return result
+
+
+def save_web_check(result):
+    conn = db()
+    conn.execute("""
+        INSERT INTO web_checks (target_id, timestamp, ok, status_code, response_ms,
+                                resolved_ip, cert_days, cert_valid, keyword_ok, final_url, error)
+        VALUES (:target_id, :timestamp, :ok, :status_code, :response_ms,
+                :resolved_ip, :cert_days, :cert_valid, :keyword_ok, :final_url, :error)
+    """, result)
+    conn.commit()
+    conn.close()
+
+
+def evaluate_web_health(target, latest):
+    """True / False / None per check, same convention as the VPS checklist:
+    None means we cannot say yet, and never counts against the target."""
+    checks = {k: None for k in WEB_CHECK_DEFS}
+    if not latest:
+        return checks
+
+    checks["reachable"] = bool(latest.get("status_code")) and not latest.get("error", "").startswith("DNS") \
+        if latest.get("error") else bool(latest.get("status_code"))
+    if latest.get("status_code") is None:
+        checks["reachable"] = False
+
+    if latest.get("status_code") is not None:
+        checks["status"] = bool(latest.get("ok"))
+
+    slow_ms = target.get("slow_ms") or WEB_SLOW_MS_DEFAULT
+    if latest.get("response_ms") is not None and latest.get("status_code") is not None:
+        checks["speed"] = latest["response_ms"] <= slow_ms
+
+    if latest.get("cert_valid") is not None:
+        checks["cert_valid"] = bool(latest["cert_valid"])
+    if latest.get("cert_days") is not None:
+        warn = target.get("cert_warn_days") or WEB_CERT_WARN_DAYS
+        checks["cert_fresh"] = latest["cert_days"] >= warn
+
+    if target.get("last_ip") and latest.get("resolved_ip"):
+        checks["ip_stable"] = target["last_ip"] == latest["resolved_ip"]
+
+    if latest.get("keyword_ok") is not None:
+        checks["keyword"] = bool(latest["keyword_ok"])
+    return checks
+
+
+def web_overall_severity(target):
+    h = target.get("health") or {}
+    if h.get("reachable") is False or h.get("status") is False or h.get("cert_valid") is False:
+        return "critical"
+    if False in (h.get("speed"), h.get("cert_fresh"), h.get("ip_stable"), h.get("keyword")):
+        return "warn"
+    if any(v is True for v in h.values()):
+        return "good"
+    return None
+
+
+# Previous per-check state, so website alerts are edge-triggered like the rest.
+_prev_web_health = {}
+
+# Which alert type corresponds to each failing website check.
+WEB_CHECK_ALERT = {
+    "reachable": "web_down",
+    "status": "web_status",
+    "speed": "web_slow",
+    "cert_valid": "web_cert_invalid",
+    "cert_fresh": "web_cert_expiring",
+    "ip_stable": "web_ip_changed",
+    "keyword": "web_keyword_missing",
+}
+
+
+def maybe_alert_web(target, health, subscriptions, latest):
+    tid = target["id"]
+    previous = _prev_web_health.get(tid, {})
+    _prev_web_health[tid] = dict(health)
+
+    for key, val in health.items():
+        old = previous.get(key)
+        if val is None or old == val:
+            continue
+        if old is None and val is True:
+            continue
+
+        alert_type = WEB_CHECK_ALERT[key]
+        label = WEB_ALERT_TYPE_LABELS[alert_type]
+        log_event("info" if val else "error", "web",
+                  f"{WEB_CHECK_DEFS[key]}: {'OK' if val else 'FAILING'}", None, target["name"])
+
+        detail = ""
+        if key == "ip_stable" and latest:
+            detail = f" ({target.get('last_ip')} -> {latest.get('resolved_ip')})"
+        elif key == "cert_fresh" and latest and latest.get("cert_days") is not None:
+            detail = f" ({latest['cert_days']:.0f} days left)"
+        elif key == "speed" and latest and latest.get("response_ms") is not None:
+            detail = f" ({latest['response_ms']:.0f} ms)"
+        elif key in ("status", "reachable") and latest:
+            detail = f" ({latest.get('error') or 'HTTP ' + str(latest.get('status_code'))})"
+
+        for email in emails_for_alert_type(subscriptions, alert_type):
+            if val:
+                subject = f"[VPS Monitor] {target['name']}: {label} - recovered"
+                body = f"{target['name']} ({target['url']}): {WEB_CHECK_DEFS[key]} is OK again{detail}."
+            else:
+                subject = f"[VPS Monitor] {target['name']}: {label}"
+                body = f"{target['name']} ({target['url']}): {WEB_CHECK_DEFS[key]} is FAILING{detail}."
+            send_alert_email(email, subject, body)
+
+
+def trim_web_checks():
+    cutoff = (utcnow() - timedelta(days=WEB_CHECK_RETENTION_DAYS)).isoformat()
+    conn = db()
+    conn.execute("DELETE FROM web_checks WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+def web_check_loop():
+    while True:
+        for target in get_web_targets():
+            if not target.get("enabled"):
+                continue
+            tid = target["id"]
+            try:
+                result = check_web_target(target)
+                save_web_check(result)
+
+                status = "ok" if result["ok"] else "error"
+                conn = db()
+                conn.execute(
+                    "UPDATE web_targets SET last_status=?, last_error=?, last_checked_at=?, last_ip=? "
+                    "WHERE id=?",
+                    (status, result["error"], result["timestamp"], result["resolved_ip"], tid)
+                )
+                conn.commit()
+                conn.close()
+
+                logger.info(
+                    f"[web:{target['name']}] {result['status_code'] or '-'} "
+                    f"{result['response_ms'] or '-'}ms ip={result['resolved_ip'] or '-'} "
+                    f"cert={result['cert_days'] or '-'}d"
+                )
+
+                fresh = get_web_target(tid)
+                fresh["health"] = evaluate_web_health(target, result)
+                maybe_alert_web(fresh, fresh["health"], get_subscriptions_for_web(tid), result)
+            except Exception as e:
+                logger.error(f"web check failed for {target['name']}: {e}")
+        trim_web_checks()
+        time.sleep(WEB_CHECK_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # Background scraper thread (this is your "Prometheus scrape loop")
 # Loops over every configured instance each cycle.
 # ---------------------------------------------------------------------------
@@ -1550,7 +1950,127 @@ def api_thresholds_set():
 
 @app.route("/api/alert-types")
 def api_alert_types():
-    return jsonify([{"key": k, "label": v} for k, v in ALERT_TYPE_LABELS.items()])
+    monitor_type = request.args.get("monitor_type", "vps")
+    table = WEB_ALERT_TYPE_LABELS if monitor_type == "web" else ALERT_TYPE_LABELS
+    return jsonify([{"key": k, "label": v} for k, v in table.items()])
+
+
+# ---------------------------------------------------------------------------
+# Website monitoring
+# ---------------------------------------------------------------------------
+@app.route("/api/web-targets")
+def api_web_targets_list():
+    targets = get_web_targets()
+    for t in targets:
+        t["latest"] = get_web_latest(t["id"])
+    return jsonify(targets)
+
+
+@app.route("/api/web-targets", methods=["POST"])
+def api_web_targets_create():
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    url = normalize_web_url(data.get("url"))
+
+    if not name or not url:
+        return jsonify({"error": "name and url are required"}), 400
+    if not urlsplit(url).hostname:
+        return jsonify({"error": "that does not look like a valid URL"}), 400
+
+    def opt_int(key):
+        v = data.get(key)
+        try:
+            return int(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    conn = db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO web_targets (name, url, expected_status, keyword, slow_ms, "
+            "cert_warn_days, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (name, url, opt_int("expected_status"), (data.get("keyword") or "").strip() or None,
+             opt_int("slow_ms"), opt_int("cert_warn_days"), utcnow().isoformat())
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "that URL is already being monitored"}), 409
+    conn.close()
+    log_audit("web.create", target=name, details=url)
+    return jsonify({"id": new_id, "name": name, "url": url}), 201
+
+
+@app.route("/api/web-targets/<int:target_id>", methods=["PATCH"])
+def api_web_targets_update(target_id):
+    data = request.get_json(force=True, silent=True) or {}
+    row = get_web_target(target_id)
+    if not row:
+        return jsonify({"error": "website not found"}), 404
+
+    name = (data.get("name") or "").strip() or row["name"]
+    url = normalize_web_url(data.get("url")) or row["url"]
+    enabled = 1 if data.get("enabled", row["enabled"]) else 0
+
+    def pick(key):
+        if key not in data:
+            return row[key]
+        v = data.get(key)
+        try:
+            return int(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    keyword = (data.get("keyword") if "keyword" in data else row["keyword"]) or None
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE web_targets SET name=?, url=?, expected_status=?, keyword=?, slow_ms=?, "
+            "cert_warn_days=?, enabled=? WHERE id=?",
+            (name, url, pick("expected_status"), keyword, pick("slow_ms"),
+             pick("cert_warn_days"), enabled, target_id)
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "another website already uses that URL"}), 409
+    conn.close()
+    log_audit("web.update", target=name, details=url)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/web-targets/<int:target_id>", methods=["DELETE"])
+def api_web_targets_delete(target_id):
+    row = get_web_target(target_id)
+    conn = db()
+    conn.execute("DELETE FROM web_targets WHERE id = ?", (target_id,))
+    conn.execute("DELETE FROM web_checks WHERE target_id = ?", (target_id,))
+    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'web'",
+                 (target_id,))
+    conn.commit()
+    conn.close()
+    _prev_web_health.pop(target_id, None)
+    log_audit("web.delete", target=row["name"] if row else f"id={target_id}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/web-checks/latest")
+def api_web_latest():
+    target_id = request.args.get("target_id", type=int)
+    if target_id is None:
+        return jsonify(None)
+    return jsonify(get_web_latest(target_id))
+
+
+@app.route("/api/web-checks/history")
+def api_web_history():
+    target_id = request.args.get("target_id", type=int)
+    if target_id is None:
+        return jsonify([])
+    return jsonify(get_web_history(target_id,
+                                    seconds=request.args.get("range_seconds", type=int),
+                                    limit=request.args.get("limit", default=200, type=int)))
 
 
 # ---------------------------------------------------------------------------
@@ -1712,19 +2232,34 @@ def api_subscriptions_create():
     email = (data.get("email") or "").strip()
     alert_type = (data.get("alert_type") or "").strip()
 
+    monitor_type = (data.get("monitor_type") or "vps").strip()
+
     if not instance_id:
-        return jsonify({"error": "instance_id is required"}), 400
+        return jsonify({"error": "a target is required"}), 400
     if not email or not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
         return jsonify({"error": "a valid email is required"}), 400
-    if alert_type not in ALERT_TYPE_LABELS:
-        return jsonify({"error": "unknown alert_type"}), 400
+    if monitor_type not in ("vps", "web"):
+        return jsonify({"error": "monitor_type must be vps or web"}), 400
+
+    valid_types = WEB_ALERT_TYPE_LABELS if monitor_type == "web" else ALERT_TYPE_LABELS
+    if alert_type not in valid_types:
+        return jsonify({"error": f"unknown alert_type for a {monitor_type} monitor"}), 400
+
+    if monitor_type == "web":
+        target = get_web_target(instance_id)
+        target_name = target["name"] if target else None
+    else:
+        target = next((i for i in get_instances() if i["id"] == instance_id), None)
+        target_name = target["name"] if target else None
+    if not target:
+        return jsonify({"error": "that target does not exist"}), 404
 
     conn = db()
     try:
         cur = conn.execute(
-            "INSERT INTO alert_subscriptions (instance_id, email, alert_type, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (instance_id, email, alert_type, utcnow().isoformat())
+            "INSERT INTO alert_subscriptions (instance_id, email, alert_type, created_at, monitor_type) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (instance_id, email, alert_type, utcnow().isoformat(), monitor_type)
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -1732,11 +2267,11 @@ def api_subscriptions_create():
         conn.close()
         return jsonify({"error": "that email is already subscribed to this alert"}), 409
     conn.close()
-    inst = next((i for i in get_instances() if i["id"] == instance_id), None)
     log_audit("subscription.create", target=email,
-              details=f"{ALERT_TYPE_LABELS[alert_type]} on {inst['name'] if inst else instance_id}")
+              details=f"{valid_types[alert_type]} on {target_name} ({monitor_type})")
     return jsonify({"id": new_id, "instance_id": instance_id, "email": email,
-                     "alert_type": alert_type, "alert_type_label": ALERT_TYPE_LABELS[alert_type]}), 201
+                     "monitor_type": monitor_type, "alert_type": alert_type,
+                     "alert_type_label": valid_types[alert_type]}), 201
 
 
 @app.route("/api/subscriptions/<int:sub_id>", methods=["DELETE"])
@@ -1757,4 +2292,5 @@ if __name__ == "__main__":
     mark_server_start()
     threading.Thread(target=scrape_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=web_check_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)

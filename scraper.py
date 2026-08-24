@@ -30,8 +30,8 @@ def main():
         f"heartbeat_interval={app.HEARTBEAT_INTERVAL_SECONDS}s"
     )
 
-    heartbeat = threading.Thread(target=app.heartbeat_loop, daemon=True)
-    heartbeat.start()
+    threading.Thread(target=app.heartbeat_loop, daemon=True).start()
+    threading.Thread(target=app.web_check_loop, daemon=True).start()
 
     # Runs forever in the foreground so systemd can supervise it directly.
     app.scrape_loop()

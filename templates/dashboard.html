@@ -615,22 +615,61 @@
       <button class="subtab active" data-sub="web-list">All Websites</button>
       <button class="subtab" data-sub="web-add">Add Website</button>
     </div>
+
     <div class="subview active" id="sub-web-list">
       <h2 class="section-title">All Websites</h2>
-      <div class="empty-state" style="max-width:640px;">
-        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">Website monitoring is not wired up yet</div>
-        The screens are here so the layout is settled, but the checks behind
-        them (HTTP status, response time, TLS certificate expiry) still need to be built. Nothing is
-        being monitored from this section right now.
+      <div id="webEmpty" class="empty-state" style="display:none; max-width:640px;">
+        No websites monitored yet. Add one from the <strong>Add Website</strong> tab,
+        or bulk-import a CSV with <code>vpsmon web import file.csv</code>.
+      </div>
+      <div class="panel-card" id="webListCard" style="max-width:1000px; display:none;">
+        <table class="subs-table" id="webTable">
+          <thead><tr>
+            <th>#</th><th>Name</th><th>URL</th><th>Code</th><th>Time</th>
+            <th>IP</th><th>Cert</th><th>State</th><th></th>
+          </tr></thead>
+          <tbody id="webTableBody"></tbody>
+        </table>
+      </div>
+      <div class="stat-sub" style="max-width:1000px;">
+        Checked from the outside every 60 seconds: DNS, HTTP status, response time,
+        TLS certificate expiry and validity, and whether the resolved IP has changed.
+        A red certificate figure means it is invalid or expiring soon.
       </div>
     </div>
+
     <div class="subview" id="sub-web-add">
-      <h2 class="section-title">Add Website</h2>
-      <div class="empty-state" style="max-width:640px;">
-        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">Website monitoring is not wired up yet</div>
-        The screens are here so the layout is settled, but the checks behind
-        them (HTTP status, response time, TLS certificate expiry) still need to be built. Nothing is
-        being monitored from this section right now.
+      <h2 class="section-title" id="webFormTitle">Add Website</h2>
+      <div class="panel-card" style="max-width:560px;">
+        <form id="addWebForm">
+          <div class="field">
+            <label>Name</label>
+            <input type="text" id="webName" placeholder="e.g. Company homepage" required>
+          </div>
+          <div class="field">
+            <label>URL</label>
+            <input type="text" id="webUrl" placeholder="example.com  (https:// is assumed)" required>
+          </div>
+          <div class="field">
+            <label>Expected HTTP status <span style="color:var(--muted);">(optional)</span></label>
+            <input type="number" id="webExpectStatus" placeholder="blank = accept any 2xx/3xx">
+          </div>
+          <div class="field">
+            <label>Keyword that must appear <span style="color:var(--muted);">(optional)</span></label>
+            <input type="text" id="webKeyword" placeholder="blank = do not check page text">
+          </div>
+          <div class="field">
+            <label>Slow above <span style="color:var(--muted);">(ms, optional)</span></label>
+            <input type="number" id="webSlowMs" placeholder="default 5000">
+          </div>
+          <div class="field">
+            <label>Warn when certificate has fewer days left than <span style="color:var(--muted);">(optional)</span></label>
+            <input type="number" id="webCertWarn" placeholder="default 21">
+          </div>
+          <button type="submit" class="btn" id="webFormSubmit">Add Website</button>
+          <button type="button" class="btn" id="webFormCancel" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
+          <div class="form-msg" id="webMsg"></div>
+        </form>
       </div>
     </div>
   </div>
@@ -935,6 +974,7 @@ const SECTION_TITLES = {
 
 // What to (re)load when a given sub-tab becomes visible.
 const SUBTAB_LOADERS = {
+  'web-list': () => refreshWebTargets(),
   'vps-list': () => renderSelectList(),
   'vps-add': () => renderManageList(),
   'vps-health': () => renderHealthChecks(),
@@ -1960,6 +2000,145 @@ async function refreshAudit() {
 }
 
 document.getElementById('auditActionFilter').addEventListener('change', refreshAudit);
+
+// ---------------------------------------------------------------------------
+// Website monitoring
+// ---------------------------------------------------------------------------
+let webTargets = [];
+let editingWebId = null;
+
+async function loadWebTargets() {
+  const res = await apiFetch('/api/web-targets');
+  webTargets = await res.json();
+}
+
+async function refreshWebTargets() {
+  await loadWebTargets();
+  renderWebList();
+}
+
+function certCell(latest) {
+  if (!latest || latest.cert_days === null || latest.cert_days === undefined) return '-';
+  const d = Math.round(latest.cert_days);
+  const invalid = latest.cert_valid === 0;
+  const colour = invalid ? 'var(--bad)' : (d < 21 ? 'var(--warn)' : 'var(--ok)');
+  return `<span style="color:${colour};">${invalid ? 'invalid' : d + 'd'}</span>`;
+}
+
+function webStateCell(t) {
+  const failing = Object.entries(t.health || {})
+    .filter(([, v]) => v === false)
+    .map(([k]) => WEB_CHECK_LABELS[k] || k);
+  if (!t.last_checked_at) return '<span style="color:var(--muted);">not checked yet</span>';
+  if (!failing.length) return '<span style="color:var(--ok);">OK</span>';
+  return `<span style="color:var(--bad);">${escapeHtml(failing.join(', '))}</span>`;
+}
+
+const WEB_CHECK_LABELS = {
+  reachable: 'unreachable', status: 'bad status', speed: 'slow',
+  cert_valid: 'cert invalid', cert_fresh: 'cert expiring',
+  ip_stable: 'IP changed', keyword: 'text missing',
+};
+
+function renderWebList() {
+  const empty = document.getElementById('webEmpty');
+  const card = document.getElementById('webListCard');
+  if (!webTargets.length) {
+    empty.style.display = 'block';
+    card.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  card.style.display = 'block';
+
+  document.getElementById('webTableBody').innerHTML = webTargets.map((t, i) => {
+    const l = t.latest || {};
+    return `<tr>
+      <td>${i + 1}</td>
+      <td style="font-weight:600; color:#fff;">${escapeHtml(t.name)}</td>
+      <td style="word-break:break-all;">${escapeHtml(t.url)}</td>
+      <td>${l.status_code ?? '-'}</td>
+      <td>${l.response_ms != null ? Math.round(l.response_ms) + ' ms' : '-'}</td>
+      <td>${escapeHtml(l.resolved_ip || '-')}</td>
+      <td>${certCell(l)}</td>
+      <td>${webStateCell(t)}</td>
+      <td style="text-align:right; white-space:nowrap;">
+        <button type="button" class="row-btn" data-web-edit="${t.id}">Edit</button>
+        <button type="button" class="row-btn danger" data-web-del="${t.id}">Delete</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  document.querySelectorAll('[data-web-edit]').forEach(b => b.addEventListener('click', () => {
+    const t = webTargets.find(x => x.id === parseInt(b.dataset.webEdit, 10));
+    if (t) startEditWeb(t);
+  }));
+  document.querySelectorAll('[data-web-del]').forEach(b => b.addEventListener('click', async () => {
+    const t = webTargets.find(x => x.id === parseInt(b.dataset.webDel, 10));
+    if (!t || !confirm(`Stop monitoring "${t.name}" and delete its history?`)) return;
+    await apiFetch('/api/web-targets/' + t.id, { method: 'DELETE' });
+    await refreshWebTargets();
+  }));
+}
+
+function startEditWeb(t) {
+  editingWebId = t.id;
+  document.getElementById('webFormTitle').textContent = 'Edit Website';
+  document.getElementById('webName').value = t.name;
+  document.getElementById('webUrl').value = t.url;
+  document.getElementById('webExpectStatus').value = t.expected_status ?? '';
+  document.getElementById('webKeyword').value = t.keyword ?? '';
+  document.getElementById('webSlowMs').value = t.slow_ms ?? '';
+  document.getElementById('webCertWarn').value = t.cert_warn_days ?? '';
+  document.getElementById('webFormSubmit').textContent = 'Save Changes';
+  document.getElementById('webFormCancel').style.display = 'inline-block';
+  document.getElementById('webMsg').textContent = '';
+  showSubTab(document.getElementById('view-web'), 'web-add');
+}
+
+function cancelEditWeb() {
+  editingWebId = null;
+  document.getElementById('webFormTitle').textContent = 'Add Website';
+  document.getElementById('addWebForm').reset();
+  document.getElementById('webFormSubmit').textContent = 'Add Website';
+  document.getElementById('webFormCancel').style.display = 'none';
+  document.getElementById('webMsg').textContent = '';
+}
+document.getElementById('webFormCancel').addEventListener('click', cancelEditWeb);
+
+document.getElementById('addWebForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('webMsg');
+  msg.className = 'form-msg';
+  const body = {
+    name: document.getElementById('webName').value.trim(),
+    url: document.getElementById('webUrl').value.trim(),
+    expected_status: document.getElementById('webExpectStatus').value,
+    keyword: document.getElementById('webKeyword').value.trim(),
+    slow_ms: document.getElementById('webSlowMs').value,
+    cert_warn_days: document.getElementById('webCertWarn').value,
+  };
+  const res = editingWebId
+    ? await apiFetch('/api/web-targets/' + editingWebId, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    : await apiFetch('/api/web-targets', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    const wasEditing = editingWebId;
+    cancelEditWeb();
+    await refreshWebTargets();
+    if (!wasEditing) {
+      msg.textContent = 'Added. The first check runs within a minute.';
+      msg.className = 'form-msg ok';
+    }
+    showSubTab(document.getElementById('view-web'), 'web-list');
+  } else {
+    msg.textContent = data.error || 'Failed to save website.';
+    msg.className = 'form-msg error';
+  }
+});
+
 
 // ---------------------------------------------------------------------------
 // Metrics polling

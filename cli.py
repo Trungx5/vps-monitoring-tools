@@ -319,6 +319,122 @@ def cmd_alert_remove(args):
 
 
 # ---------------------------------------------------------------------------
+# web (website monitoring)
+# ---------------------------------------------------------------------------
+def resolve_web(ref):
+    targets = app.get_web_targets()
+    if ref.isdigit():
+        m = next((t for t in targets if t['id'] == int(ref)), None)
+        if m:
+            return m
+    matches = [t for t in targets if t['name'].lower() == ref.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die(f"several websites are named {ref!r}; use the numeric id instead")
+    die(f"no website matching {ref!r} (try: vpsmon web list)")
+
+
+def cmd_web_list(args):
+    rows = []
+    for t in app.get_web_targets():
+        latest = app.get_web_latest(t['id']) or {}
+        failing = [app.WEB_CHECK_DEFS[k] for k, v in (t.get('health') or {}).items() if v is False]
+        rows.append([
+            t['id'], t['name'], t['url'],
+            fmt(latest.get('status_code')),
+            f"{latest['response_ms']:.0f}" if latest.get('response_ms') is not None else '-',
+            fmt(latest.get('resolved_ip')),
+            f"{latest['cert_days']:.0f}" if latest.get('cert_days') is not None else '-',
+            ', '.join(failing) or 'ok',
+        ])
+    table(["ID", "NAME", "URL", "CODE", "MS", "IP", "CERTd", "FAILING"], rows)
+
+
+def cmd_web_add(args):
+    url = app.normalize_web_url(args.url)
+    conn = app.db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO web_targets (name, url, expected_status, keyword, slow_ms, "
+            "cert_warn_days, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (args.name, url, args.expect_status, args.keyword, args.slow_ms,
+             args.cert_warn_days, app.utcnow().isoformat())
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        die(f"{url} is already being monitored")
+    finally:
+        conn.close()
+    audit("web.create", args.name, url)
+    ok(f"Added website {new_id}: {args.name} -> {url}")
+
+
+def cmd_web_remove(args):
+    t = resolve_web(args.target)
+    if not args.yes:
+        if input(f"Delete website {t['name']!r} and its history? [y/N] ").strip().lower() not in ('y', 'yes'):
+            ok("Cancelled."); return
+    conn = app.db()
+    conn.execute("DELETE FROM web_targets WHERE id = ?", (t['id'],))
+    conn.execute("DELETE FROM web_checks WHERE target_id = ?", (t['id'],))
+    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'web'", (t['id'],))
+    conn.commit(); conn.close()
+    audit("web.delete", t['name'])
+    ok(f"Deleted website {t['id']} ({t['name']}).")
+
+
+def cmd_web_check(args):
+    """Run a check right now instead of waiting for the next cycle."""
+    targets = [resolve_web(args.target)] if args.target else app.get_web_targets()
+    rows = []
+    for t in targets:
+        r = app.check_web_target(t)
+        app.save_web_check(r)
+        conn = app.db()
+        conn.execute("UPDATE web_targets SET last_status=?, last_error=?, last_checked_at=?, last_ip=? WHERE id=?",
+                     ('ok' if r['ok'] else 'error', r['error'], r['timestamp'], r['resolved_ip'], t['id']))
+        conn.commit(); conn.close()
+        rows.append([t['name'], 'OK' if r['ok'] else 'FAIL', fmt(r['status_code']),
+                     f"{r['response_ms']:.0f}" if r['response_ms'] is not None else '-',
+                     fmt(r['resolved_ip']),
+                     f"{r['cert_days']:.0f}" if r['cert_days'] is not None else '-',
+                     {1: 'yes', 0: 'NO', None: '-'}[r['cert_valid']],
+                     (r['error'] or '')[:40]])
+    table(["NAME", "RESULT", "CODE", "MS", "IP", "CERTd", "CERT OK", "ERROR"], rows)
+
+
+def cmd_web_import(args):
+    """Bulk-add websites from a CSV with 'name'/'company' and 'domain'/'url' columns."""
+    import csv
+    added = skipped = 0
+    with open(args.file, encoding='utf-8-sig', newline='') as fh:
+        for row in csv.DictReader(fh):
+            keys = {k.lower().strip(): (v or '').strip() for k, v in row.items() if k}
+            name = keys.get('name') or keys.get('company') or ''
+            url = keys.get('url') or keys.get('domain') or ''
+            if not name or not url or url.upper().startswith('UNCONFIRMED') or not any(c.isalpha() for c in url):
+                skipped += 1
+                continue
+            url = app.normalize_web_url(url)
+            conn = app.db()
+            try:
+                conn.execute(
+                    "INSERT INTO web_targets (name, url, enabled, created_at) VALUES (?, ?, 1, ?)",
+                    (name[:80], url, app.utcnow().isoformat())
+                )
+                conn.commit(); added += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+            finally:
+                conn.close()
+    audit("web.import", args.file, f"{added} added, {skipped} skipped")
+    ok(f"Imported {added} website(s); skipped {skipped} (duplicates or missing/unconfirmed URL).")
+    ok("Run 'vpsmon web check' to test them all immediately.")
+
+
+# ---------------------------------------------------------------------------
 # user
 # ---------------------------------------------------------------------------
 def prompt_password(label="Password"):
@@ -542,6 +658,36 @@ def build_parser():
     p = al_sub.add_parser("remove", help="remove a subscription by id")
     p.add_argument("id", type=int)
     p.set_defaults(func=cmd_alert_remove)
+
+    # --- web ---
+    web = sub.add_parser("web", help="monitor websites (uptime, speed, TLS, IP changes)")
+    web_sub = web.add_subparsers(dest="sub", required=True)
+    web_sub.add_parser("list", help="list monitored websites").set_defaults(func=cmd_web_list)
+
+    p = web_sub.add_parser("add", help="add a website")
+    p.add_argument("--name", required=True)
+    p.add_argument("--url", required=True, help="https:// is assumed if no scheme is given")
+    p.add_argument("--keyword", help="text that must appear on the page")
+    p.add_argument("--expect-status", dest="expect_status", type=int,
+                   help="require this exact HTTP code (default: any 2xx/3xx)")
+    p.add_argument("--slow-ms", dest="slow_ms", type=int,
+                   help="flag as slow above this many milliseconds")
+    p.add_argument("--cert-warn-days", dest="cert_warn_days", type=int,
+                   help="warn when the TLS certificate has fewer days left than this")
+    p.set_defaults(func=cmd_web_add)
+
+    p = web_sub.add_parser("remove", help="stop monitoring a website")
+    p.add_argument("target", help="website name or id")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(func=cmd_web_remove)
+
+    p = web_sub.add_parser("check", help="run a check now rather than waiting")
+    p.add_argument("target", nargs="?", help="website name or id (default: all)")
+    p.set_defaults(func=cmd_web_check)
+
+    p = web_sub.add_parser("import", help="bulk add from a CSV (name/company + url/domain columns)")
+    p.add_argument("file")
+    p.set_defaults(func=cmd_web_import)
 
     # --- user ---
     us = sub.add_parser("user", help="manage dashboard accounts")
