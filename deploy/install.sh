@@ -55,8 +55,16 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 echo "==> Installing the vpsmon command"
+# Runs as the service account rather than whoever invoked it. Two reasons:
+# the config file is root:vpsmon 640 so a normal login user cannot read it,
+# and anything the CLI writes (database, log) must stay owned by vpsmon or
+# the services themselves lose write access to their own data.
 cat > /usr/local/bin/vpsmon <<EOF
 #!/usr/bin/env bash
+set -euo pipefail
+if [[ "\$(id -un)" != "$APP_USER" ]]; then
+    exec sudo -u $APP_USER -- "\$0" "\$@"
+fi
 set -a; . $ENV_FILE; set +a
 cd $APP_DIR && exec $VENV/bin/python cli.py "\$@"
 EOF
