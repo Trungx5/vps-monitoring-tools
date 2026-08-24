@@ -330,6 +330,67 @@
   }
   .subs-table .row-btn:hover { border-color: var(--accent); color: var(--accent); }
   .subs-table .row-btn.danger:hover { border-color: var(--bad); color: var(--bad); }
+
+  /* ---------------- Section sub-navigation ---------------- */
+  .subtabs {
+    display: flex; gap: 4px; flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 22px;
+  }
+  .subtab {
+    background: none; border: none; border-bottom: 2px solid transparent;
+    color: var(--muted); padding: 9px 14px; font-size: 13px; cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .subtab:hover { color: var(--text); }
+  .subtab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .subview { display: none; }
+  .subview.active { display: block; }
+
+  /* ---------------- Main Monitor picker ---------------- */
+  .monitor-picker {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    margin-bottom: 24px;
+  }
+  .picker-field { display: flex; flex-direction: column; gap: 6px; min-width: 240px; }
+  .picker-field label { font-size: 11.5px; color: var(--muted); }
+  .picker-field select {
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 10px 12px; font-size: 13.5px;
+  }
+  .picker-field select:focus { outline: none; border-color: var(--accent); }
+
+  /* ---------------- Target heading (big white name) ---------------- */
+  .target-header { margin-bottom: 20px; }
+  .target-name {
+    font-size: 30px; font-weight: 700; color: #fff; line-height: 1.15;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .target-info { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+
+  /* ---------------- Overall status grid ---------------- */
+  .overview-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px;
+  }
+  .overview-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px; cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .overview-card:hover { border-color: var(--accent); }
+  .overview-card.warn { border-color: var(--warn); }
+  .overview-card.critical, .overview-card.down { border-color: var(--bad); }
+  .overview-name {
+    font-size: 20px; font-weight: 700; color: #fff;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .overview-sub { font-size: 11.5px; color: var(--muted); margin-top: 4px; word-break: break-all; }
+  .overview-metrics {
+    display: flex; gap: 18px; margin-top: 14px; flex-wrap: wrap;
+  }
+  .overview-metric .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .overview-metric .v { font-size: 17px; font-weight: 600; margin-top: 2px; }
+  .overview-note { font-size: 11.5px; margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -341,15 +402,12 @@
     <button class="sidebar-close" id="sidebarClose">&times;</button>
   </div>
   <div class="sidebar-nav">
-    <button data-view="dashboard" class="nav-btn active">Main Menu</button>
-    <button data-view="instances" class="nav-btn admin-only">Add Monitoring Instance</button>
-    <button data-view="select" class="nav-btn">Choose a VPS</button>
-    <button data-view="health" class="nav-btn">Health Checks</button>
-    <button data-view="alerts" class="nav-btn admin-only">Alerts</button>
-    <button data-view="logs" class="nav-btn">Logs</button>
-    <button data-view="users" class="nav-btn admin-only">Users</button>
-    <button data-view="audit" class="nav-btn admin-only">Audit Log</button>
-    <button data-view="account" class="nav-btn">My Account</button>
+    <button data-view="main" class="nav-btn active">Main Monitor</button>
+    <button data-view="vps" class="nav-btn">VPS Monitor</button>
+    <button data-view="web" class="nav-btn">Web Monitor</button>
+    <button data-view="ip" class="nav-btn">IP Monitor</button>
+    <button data-view="notify" class="nav-btn">Notification and Alert</button>
+    <button data-view="config" class="nav-btn admin-only">Configuration and Account</button>
   </div>
   <div class="sidebar-footer">
     <div id="sidebarWhoami" class="whoami">Signed in</div>
@@ -360,355 +418,465 @@
 <div class="topbar">
   <button class="hamburger-btn" id="hamburgerBtn">&#9776;</button>
   <div class="topbar-titles">
-    <h1><span class="status-dot" id="statusDot"></span>VPS Monitor<span id="topbarSeverity"></span></h1>
-    <div class="subtitle" id="topbarSubtitle">No instance selected</div>
+    <h1 id="sectionTitle"><span class="status-dot" id="statusDot"></span>Main Monitor</h1>
   </div>
-  <select id="topbarInstanceSelect" class="topbar-instance-select" title="Switch VPS"></select>
+  <select id="topbarInstanceSelect" class="topbar-instance-select" title="Switch target"></select>
 </div>
 
 <div class="content">
 
-  <!-- ===================== Dashboard view ===================== -->
-  <div class="view active" id="view-dashboard">
-    <div id="dashboardEmpty" class="empty-state" style="display:none;">
-      No VPS instances yet. Open the menu and choose <strong>Add Monitoring Instance</strong> to get started.
-    </div>
-    <div id="dashboardBody" style="display:none;">
-      <div class="scrape-error-banner" id="scrapeErrorBanner" style="display:none;"></div>
-      <div class="grid">
-        <div class="stat-card" id="card-cpu">
-          <div class="stat-label">CPU</div>
-          <div class="stat-value" id="cpuValue">--</div>
-          <div class="stat-sub" id="loadValue">load1: --</div>
-        </div>
-        <div class="stat-card" id="card-mem">
-          <div class="stat-label">Memory</div>
-          <div class="stat-value" id="memValue">--</div>
-          <div class="stat-sub" id="memSub">--</div>
-        </div>
-        <div class="stat-card" id="card-disk">
-          <div class="stat-label">Disk</div>
-          <div class="stat-value" id="diskValue">--</div>
-          <div class="stat-sub" id="diskSub">--</div>
-        </div>
-        <div class="stat-card" id="card-bw">
-          <div class="stat-label">Bandwidth</div>
-          <div class="stat-value" id="bwValue">--</div>
-          <div class="stat-sub" id="bwSub">rx/s &middot; tx/s</div>
-        </div>
-        <div class="stat-card" id="card-diskio">
-          <div class="stat-label">Disk I/O</div>
-          <div class="stat-value" id="diskioValue">--</div>
-          <div class="stat-sub" id="diskioSub">read/s &middot; write/s</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Network (cumulative)</div>
-          <div class="stat-value" id="netValue">--</div>
-          <div class="stat-sub" id="netSub">rx / tx</div>
-        </div>
-      </div>
-
-      <div class="chart-range-bar">
-        <label for="rangeSelect">Charts range</label>
-        <select id="rangeSelect">
-          <option value="30">Last 30 seconds</option>
-          <option value="60">Last 1 minute</option>
-          <option value="120">Last 2 minutes</option>
-          <option value="300">Last 5 minutes</option>
-          <option value="600" selected>Last 10 minutes</option>
-          <option value="1800">Last 30 minutes</option>
-          <option value="3600">Last 1 hour</option>
-          <option value="7200">Last 2 hours</option>
-          <option value="21600">Last 6 hours</option>
-          <option value="43200">Last 12 hours</option>
-          <option value="86400">Last 24 hours</option>
-          <option value="172800">Last 2 days</option>
-          <option value="259200">Last 3 days</option>
-          <option value="604800">Last 7 days</option>
+  <!-- ===================== 1. MAIN MONITOR ===================== -->
+  <div class="view active" id="view-main">
+    <div class="monitor-picker">
+      <div class="picker-field">
+        <label for="mainTypeSelect">What do you want to check?</label>
+        <select id="mainTypeSelect">
+          <option value="vps">VPS Monitor</option>
+          <option value="web">Web Monitor</option>
+          <option value="ip">IP Monitor</option>
         </select>
       </div>
+      <div class="picker-field">
+        <label for="mainTargetSelect">Which one?</label>
+        <select id="mainTargetSelect">
+          <option value="">All &mdash; overall status</option>
+        </select>
+      </div>
+    </div>
 
-      <div class="charts-grid">
-        <div class="chart-card">
-          <div class="chart-title">CPU %</div>
-          <canvas id="cpuChart"></canvas>
+    <div id="mainUnavailable" class="empty-state" style="display:none; max-width:640px;"></div>
+
+    <!-- default view: overall status of every target of the chosen type -->
+    <div id="mainOverview">
+      <div id="overviewEmpty" class="empty-state" style="display:none;">Nothing to show yet.</div>
+      <div class="overview-grid" id="overviewGrid"></div>
+    </div>
+
+    <!-- one specific target selected -->
+    <div id="mainDetail" style="display:none;">
+      <div class="target-header">
+        <div class="target-name" id="detailName">&mdash;</div>
+        <div class="target-info" id="detailInfo"></div>
+      </div>
+        <div id="dashboardEmpty" class="empty-state" style="display:none;">
+          No VPS instances yet. Open the menu and choose <strong>Add Monitoring Instance</strong> to get started.
         </div>
-        <div class="chart-card">
-          <div class="chart-title">Memory %</div>
-          <canvas id="memChart"></canvas>
+        <div id="dashboardBody" style="display:none;">
+          <div class="scrape-error-banner" id="scrapeErrorBanner" style="display:none;"></div>
+          <div class="grid">
+            <div class="stat-card" id="card-cpu">
+              <div class="stat-label">CPU</div>
+              <div class="stat-value" id="cpuValue">--</div>
+              <div class="stat-sub" id="loadValue">load1: --</div>
+            </div>
+            <div class="stat-card" id="card-mem">
+              <div class="stat-label">Memory</div>
+              <div class="stat-value" id="memValue">--</div>
+              <div class="stat-sub" id="memSub">--</div>
+            </div>
+            <div class="stat-card" id="card-disk">
+              <div class="stat-label">Disk</div>
+              <div class="stat-value" id="diskValue">--</div>
+              <div class="stat-sub" id="diskSub">--</div>
+            </div>
+            <div class="stat-card" id="card-bw">
+              <div class="stat-label">Bandwidth</div>
+              <div class="stat-value" id="bwValue">--</div>
+              <div class="stat-sub" id="bwSub">rx/s &middot; tx/s</div>
+            </div>
+            <div class="stat-card" id="card-diskio">
+              <div class="stat-label">Disk I/O</div>
+              <div class="stat-value" id="diskioValue">--</div>
+              <div class="stat-sub" id="diskioSub">read/s &middot; write/s</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Network (cumulative)</div>
+              <div class="stat-value" id="netValue">--</div>
+              <div class="stat-sub" id="netSub">rx / tx</div>
+            </div>
+          </div>
+
+          <div class="chart-range-bar">
+            <label for="rangeSelect">Charts range</label>
+            <select id="rangeSelect">
+              <option value="30">Last 30 seconds</option>
+              <option value="60">Last 1 minute</option>
+              <option value="120">Last 2 minutes</option>
+              <option value="300">Last 5 minutes</option>
+              <option value="600" selected>Last 10 minutes</option>
+              <option value="1800">Last 30 minutes</option>
+              <option value="3600">Last 1 hour</option>
+              <option value="7200">Last 2 hours</option>
+              <option value="21600">Last 6 hours</option>
+              <option value="43200">Last 12 hours</option>
+              <option value="86400">Last 24 hours</option>
+              <option value="172800">Last 2 days</option>
+              <option value="259200">Last 3 days</option>
+              <option value="604800">Last 7 days</option>
+            </select>
+          </div>
+
+          <div class="charts-grid">
+            <div class="chart-card">
+              <div class="chart-title">CPU %</div>
+              <canvas id="cpuChart"></canvas>
+            </div>
+            <div class="chart-card">
+              <div class="chart-title">Memory %</div>
+              <canvas id="memChart"></canvas>
+            </div>
+            <div class="chart-card">
+              <div class="chart-title">Disk %</div>
+              <canvas id="diskChart"></canvas>
+            </div>
+            <div class="chart-card">
+              <div class="chart-title">Bandwidth (bytes/sec)</div>
+              <canvas id="bwChart"></canvas>
+            </div>
+            <div class="chart-card">
+              <div class="chart-title">Disk I/O (bytes/sec)</div>
+              <canvas id="diskioChart"></canvas>
+            </div>
+            <div class="chart-card">
+              <div class="chart-title">Network Throughput (bytes total)</div>
+              <canvas id="netChart"></canvas>
+            </div>
+          </div>
         </div>
-        <div class="chart-card">
-          <div class="chart-title">Disk %</div>
-          <canvas id="diskChart"></canvas>
+    </div>
+  </div>
+
+  <!-- ===================== 2. VPS MONITOR ===================== -->
+  <div class="view" id="view-vps">
+    <div class="subtabs">
+      <button class="subtab active" data-sub="vps-list">All VPS</button>
+      <button class="subtab" data-sub="vps-add">Add / Edit VPS</button>
+      <button class="subtab" data-sub="vps-health">Health Checks</button>
+    </div>
+    <div class="subview active" id="sub-vps-list">
+        <h2 class="section-title">Choose a VPS</h2>
+        <div class="panel-card" id="selectInstList" style="max-width:560px;">
+          <div class="empty-state" id="selectInstEmpty">No instances yet.</div>
         </div>
-        <div class="chart-card">
-          <div class="chart-title">Bandwidth (bytes/sec)</div>
-          <canvas id="bwChart"></canvas>
+    </div>
+    <div class="subview" id="sub-vps-add">
+        <h2 class="section-title" id="instFormTitle">Add Monitoring Instance</h2>
+        <div class="panel-card">
+          <h3 id="instFormSubtitle">New VPS</h3>
+          <form id="addInstanceForm">
+            <div class="field">
+              <label>Name</label>
+              <input type="text" id="newInstName" placeholder="e.g. Production API" required>
+            </div>
+            <div class="field">
+              <label>node_exporter URL</label>
+              <input type="text" id="newInstUrl" placeholder="http://1.2.3.4:9100/metrics" required>
+            </div>
+            <div class="field">
+              <label>Basic Auth username <span style="color:var(--muted);">(optional)</span></label>
+              <input type="text" id="newInstAuthUser" placeholder="leave blank if node_exporter has no auth" autocomplete="off">
+            </div>
+            <div class="field">
+              <label>Basic Auth password <span style="color:var(--muted);" id="newInstAuthPassHint">(optional)</span></label>
+              <input type="password" id="newInstAuthPass" placeholder="leave blank if node_exporter has no auth" autocomplete="new-password">
+            </div>
+            <button type="submit" class="btn" id="instFormSubmitBtn">Add Instance</button>
+            <button type="button" class="btn" id="instFormCancelBtn" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
+            <div class="form-msg" id="addInstMsg"></div>
+          </form>
         </div>
-        <div class="chart-card">
-          <div class="chart-title">Disk I/O (bytes/sec)</div>
-          <canvas id="diskioChart"></canvas>
+
+        <h2 class="section-title">Existing Instances</h2>
+        <div class="panel-card" id="manageInstList" style="max-width:560px;">
+          <div class="empty-state" id="manageInstEmpty">No instances yet.</div>
         </div>
-        <div class="chart-card">
-          <div class="chart-title">Network Throughput (bytes total)</div>
-          <canvas id="netChart"></canvas>
+    </div>
+    <div class="subview" id="sub-vps-health">
+        <h2 class="section-title" id="healthTargetLabel">Health Checks</h2>
+        <div class="panel-card" style="max-width:560px;">
+          <div id="healthEmpty" class="empty-state" style="display:none;">
+            Add and select a VPS instance first.
+          </div>
+          <div id="healthChecksList"></div>
         </div>
+        <div class="stat-sub" style="max-width:560px;">
+          Pass/fail checks evaluated every scrape, separate from the Warn/Critical
+          thresholds. A check shows "Unknown" when there isn't enough history yet or
+          this node_exporter build doesn't expose that metric. If an alert email is
+          set (Alerts panel), you'll get one whenever any check flips from passing
+          to failing, or back.
+        </div>
+    </div>
+  </div>
+
+  <!-- ===================== 3. WEB MONITOR (scaffold) ===================== -->
+  <div class="view" id="view-web">
+    <div class="subtabs">
+      <button class="subtab active" data-sub="web-list">All Websites</button>
+      <button class="subtab" data-sub="web-add">Add Website</button>
+    </div>
+    <div class="subview active" id="sub-web-list">
+      <h2 class="section-title">All Websites</h2>
+      <div class="empty-state" style="max-width:640px;">
+        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">Website monitoring is not wired up yet</div>
+        The screens are here so the layout is settled, but the checks behind
+        them (HTTP status, response time, TLS certificate expiry) still need to be built. Nothing is
+        being monitored from this section right now.
+      </div>
+    </div>
+    <div class="subview" id="sub-web-add">
+      <h2 class="section-title">Add Website</h2>
+      <div class="empty-state" style="max-width:640px;">
+        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">Website monitoring is not wired up yet</div>
+        The screens are here so the layout is settled, but the checks behind
+        them (HTTP status, response time, TLS certificate expiry) still need to be built. Nothing is
+        being monitored from this section right now.
       </div>
     </div>
   </div>
 
-  <!-- ===================== Add / manage instances view ===================== -->
-  <div class="view" id="view-instances">
-    <h2 class="section-title" id="instFormTitle">Add Monitoring Instance</h2>
-    <div class="panel-card">
-      <h3 id="instFormSubtitle">New VPS</h3>
-      <form id="addInstanceForm">
-        <div class="field">
-          <label>Name</label>
-          <input type="text" id="newInstName" placeholder="e.g. Production API" required>
-        </div>
-        <div class="field">
-          <label>node_exporter URL</label>
-          <input type="text" id="newInstUrl" placeholder="http://1.2.3.4:9100/metrics" required>
-        </div>
-        <div class="field">
-          <label>Basic Auth username <span style="color:var(--muted);">(optional)</span></label>
-          <input type="text" id="newInstAuthUser" placeholder="leave blank if node_exporter has no auth" autocomplete="off">
-        </div>
-        <div class="field">
-          <label>Basic Auth password <span style="color:var(--muted);" id="newInstAuthPassHint">(optional)</span></label>
-          <input type="password" id="newInstAuthPass" placeholder="leave blank if node_exporter has no auth" autocomplete="new-password">
-        </div>
-        <button type="submit" class="btn" id="instFormSubmitBtn">Add Instance</button>
-        <button type="button" class="btn" id="instFormCancelBtn" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
-        <div class="form-msg" id="addInstMsg"></div>
-      </form>
+  <!-- ===================== 4. IP MONITOR (scaffold) ===================== -->
+  <div class="view" id="view-ip">
+    <div class="subtabs">
+      <button class="subtab active" data-sub="ip-list">All IP Addresses</button>
+      <button class="subtab" data-sub="ip-add">Add IP Address</button>
     </div>
-
-    <h2 class="section-title">Existing Instances</h2>
-    <div class="panel-card" id="manageInstList" style="max-width:560px;">
-      <div class="empty-state" id="manageInstEmpty">No instances yet.</div>
-    </div>
-  </div>
-
-  <!-- ===================== Select VPS view ===================== -->
-  <div class="view" id="view-select">
-    <h2 class="section-title">Choose a VPS</h2>
-    <div class="panel-card" id="selectInstList" style="max-width:560px;">
-      <div class="empty-state" id="selectInstEmpty">No instances yet.</div>
-    </div>
-  </div>
-
-  <!-- ===================== Health Checks view ===================== -->
-  <div class="view" id="view-health">
-    <h2 class="section-title" id="healthTargetLabel">Health Checks</h2>
-    <div class="panel-card" style="max-width:560px;">
-      <div id="healthEmpty" class="empty-state" style="display:none;">
-        Add and select a VPS instance first.
+    <div class="subview active" id="sub-ip-list">
+      <h2 class="section-title">All IP Addresses</h2>
+      <div class="empty-state" style="max-width:640px;">
+        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">IP monitoring is not wired up yet</div>
+        The screens are here so the layout is settled, but the checks behind
+        them (ping and port reachability, DNS-to-IP change detection) still need to be built. Nothing is
+        being monitored from this section right now.
       </div>
-      <div id="healthChecksList"></div>
     </div>
-    <div class="stat-sub" style="max-width:560px;">
-      Pass/fail checks evaluated every scrape, separate from the Warn/Critical
-      thresholds. A check shows "Unknown" when there isn't enough history yet or
-      this node_exporter build doesn't expose that metric. If an alert email is
-      set (Alerts panel), you'll get one whenever any check flips from passing
-      to failing, or back.
+    <div class="subview" id="sub-ip-add">
+      <h2 class="section-title">Add IP Address</h2>
+      <div class="empty-state" style="max-width:640px;">
+        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">IP monitoring is not wired up yet</div>
+        The screens are here so the layout is settled, but the checks behind
+        them (ping and port reachability, DNS-to-IP change detection) still need to be built. Nothing is
+        being monitored from this section right now.
+      </div>
     </div>
   </div>
 
-  <!-- ===================== Alerts view ===================== -->
-  <div class="view" id="view-alerts">
-    <div id="alertsNoInstances" class="empty-state" style="display:none; max-width:640px;">
-      No VPS instances yet. Open the menu and choose <strong>Add Monitoring Instance</strong> to get started.
+  <!-- ===================== 5. NOTIFICATION AND ALERT ===================== -->
+  <div class="view" id="view-notify">
+    <div class="subtabs">
+      <button class="subtab active" data-sub="notify-add">Add Alert</button>
+      <button class="subtab" data-sub="notify-list">Alert List</button>
     </div>
-    <div id="alertsViewBody" style="display:none;">
 
-    <h2 class="section-title">Alert Recipients</h2>
-    <div class="panel-card" style="max-width:720px;">
-      <div id="subsEmpty" class="empty-state" style="display:none;">
-        No alert subscriptions yet. Add one below.
+    <div class="subview active" id="sub-notify-add">
+      <h2 class="section-title">Add Alert</h2>
+      <div id="alertsNoInstances" class="empty-state" style="display:none; max-width:640px;">
+        Nothing to alert on yet &mdash; add a VPS first under <strong>VPS Monitor</strong>.
       </div>
-      <table class="subs-table" id="subsTable" style="display:none;">
-        <thead><tr><th>#</th><th>Instance</th><th>Email</th><th>Alert</th><th></th></tr></thead>
-        <tbody id="subsTableBody"></tbody>
-      </table>
+      <div id="alertsViewBody" style="display:none;">
+        <div class="panel-card" style="max-width:560px;">
+          <form id="addSubForm">
+            <div class="field">
+              <label>Monitor type</label>
+              <select id="subMonitorType">
+                <option value="vps">VPS</option>
+                <option value="web" disabled>Web (not available yet)</option>
+                <option value="ip" disabled>IP (not available yet)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Target</label>
+              <select id="subInstance"></select>
+            </div>
+            <div class="field">
+              <label>Send to email</label>
+              <input type="email" id="subEmail" placeholder="you@example.com" required>
+            </div>
+            <div class="field">
+              <label>Alert on</label>
+              <select id="subAlertType"></select>
+            </div>
+            <button type="submit" class="btn">Add Alert</button>
+            <div class="form-msg" id="subMsg"></div>
+          </form>
+        </div>
+        <div class="stat-sub" style="max-width:560px;">
+          One row per (target, email, alert). The same address can be added to several
+          alerts, and different people can be wired to different ones. Email is sent on a
+          change of state, not on every check.
+        </div>
+      </div>
+    </div>
 
-      <button type="button" class="btn" id="addSubBtn" style="margin-top:14px;">+ Add Subscription</button>
+    <div class="subview" id="sub-notify-list">
+      <h2 class="section-title">Alert List</h2>
+      <div class="panel-card" style="max-width:820px;">
+        <div id="subsEmpty" class="empty-state" style="display:none;">
+          No alerts configured yet. Add one from the <strong>Add Alert</strong> tab.
+        </div>
+        <table class="subs-table" id="subsTable" style="display:none;">
+          <thead><tr><th>#</th><th>Type</th><th>Target</th><th>Email</th><th>Alert</th><th></th></tr></thead>
+          <tbody id="subsTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
-      <form id="addSubForm" style="display:none; margin-top:14px;">
+  <!-- ===================== 6. CONFIGURATION AND ACCOUNT ===================== -->
+  <div class="view" id="view-config">
+    <div class="subtabs">
+      <button class="subtab active" data-sub="config-thresholds">Thresholds</button>
+      <button class="subtab" data-sub="config-users">Users</button>
+      <button class="subtab" data-sub="config-audit">Audit Log</button>
+      <button class="subtab" data-sub="config-logs">Event Logs</button>
+      <button class="subtab" data-sub="config-account">My Account</button>
+    </div>
+    <div class="subview active" id="sub-config-thresholds">
+      <h2 class="section-title">Thresholds</h2>
+      <div class="panel-card" style="max-width:560px;">
         <div class="field">
           <label>Instance</label>
-          <select id="subInstance"></select>
+          <select id="threshInstance"></select>
         </div>
-        <div class="field">
-          <label>Email</label>
-          <input type="email" id="subEmail" placeholder="you@example.com" required>
-        </div>
-        <div class="field">
-          <label>Alert</label>
-          <select id="subAlertType"></select>
-        </div>
-        <button type="submit" class="btn">Save</button>
-        <button type="button" class="btn" id="cancelSubBtn" style="background:var(--border); color:var(--text);">Cancel</button>
-        <div class="form-msg" id="subMsg"></div>
-      </form>
-    </div>
+        <form id="alertsForm">
+          <table class="thresh-table">
+            <thead><tr><th>Metric</th><th>Warn</th><th>Critical</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>CPU (%)</td>
+                <td><input type="number" step="0.1" min="0" max="100" id="cpuWarn" placeholder="75"></td>
+                <td><input type="number" step="0.1" min="0" max="100" id="cpuCrit" placeholder="90"></td>
+              </tr>
+              <tr>
+                <td>Memory (%)</td>
+                <td><input type="number" step="0.1" min="0" max="100" id="memWarn" placeholder="75"></td>
+                <td><input type="number" step="0.1" min="0" max="100" id="memCrit" placeholder="90"></td>
+              </tr>
+              <tr>
+                <td>Disk (%)</td>
+                <td><input type="number" step="0.1" min="0" max="100" id="diskWarn" placeholder="75"></td>
+                <td><input type="number" step="0.1" min="0" max="100" id="diskCrit" placeholder="90"></td>
+              </tr>
+              <tr>
+                <td>Bandwidth (B/s)</td>
+                <td><input type="number" step="1" min="0" id="netWarn" placeholder="8000000"></td>
+                <td><input type="number" step="1" min="0" id="netCrit" placeholder="10000000"></td>
+              </tr>
+              <tr>
+                <td>Disk I/O (B/s)</td>
+                <td><input type="number" step="1" min="0" id="diskioWarn" placeholder="50000000"></td>
+                <td><input type="number" step="1" min="0" id="diskioCrit" placeholder="100000000"></td>
+              </tr>
+            </tbody>
+          </table>
 
-    <h2 class="section-title">Thresholds</h2>
-    <div class="panel-card" style="max-width:560px;">
-      <div class="field">
-        <label>Instance</label>
-        <select id="threshInstance"></select>
-      </div>
-      <form id="alertsForm">
-        <table class="thresh-table">
-          <thead><tr><th>Metric</th><th>Warn</th><th>Critical</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>CPU (%)</td>
-              <td><input type="number" step="0.1" min="0" max="100" id="cpuWarn" placeholder="75"></td>
-              <td><input type="number" step="0.1" min="0" max="100" id="cpuCrit" placeholder="90"></td>
-            </tr>
-            <tr>
-              <td>Memory (%)</td>
-              <td><input type="number" step="0.1" min="0" max="100" id="memWarn" placeholder="75"></td>
-              <td><input type="number" step="0.1" min="0" max="100" id="memCrit" placeholder="90"></td>
-            </tr>
-            <tr>
-              <td>Disk (%)</td>
-              <td><input type="number" step="0.1" min="0" max="100" id="diskWarn" placeholder="75"></td>
-              <td><input type="number" step="0.1" min="0" max="100" id="diskCrit" placeholder="90"></td>
-            </tr>
-            <tr>
-              <td>Bandwidth (B/s)</td>
-              <td><input type="number" step="1" min="0" id="netWarn" placeholder="8000000"></td>
-              <td><input type="number" step="1" min="0" id="netCrit" placeholder="10000000"></td>
-            </tr>
-            <tr>
-              <td>Disk I/O (B/s)</td>
-              <td><input type="number" step="1" min="0" id="diskioWarn" placeholder="50000000"></td>
-              <td><input type="number" step="1" min="0" id="diskioCrit" placeholder="100000000"></td>
-            </tr>
-          </tbody>
-        </table>
-
-        <button type="submit" class="btn" style="margin-top:16px;">Save Thresholds</button>
-        <div class="form-msg" id="alertsMsg"></div>
-      </form>
-      <div class="stat-sub" style="margin-top:14px;">
-        Leave a field blank to disable that tier. Crossing Warn or Critical highlights the matching
-        stat card amber/red, and emails anyone subscribed to that specific alert above &mdash; edge
-        triggered, so one email per change of state, not one per scrape.
+          <button type="submit" class="btn" style="margin-top:16px;">Save Thresholds</button>
+          <div class="form-msg" id="alertsMsg"></div>
+        </form>
+        <div class="stat-sub" style="margin-top:14px;">
+          Leave a field blank to disable that tier. Crossing Warn or Critical highlights the matching
+          stat card amber/red, and emails anyone subscribed to that specific alert above &mdash; edge
+          triggered, so one email per change of state, not one per scrape.
+        </div>
       </div>
     </div>
+    <div class="subview" id="sub-config-users">
+        <h2 class="section-title">Users</h2>
+        <div class="panel-card" style="max-width:760px;">
+          <table class="subs-table" id="usersTable">
+            <thead><tr><th>#</th><th>Username</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr></thead>
+            <tbody id="usersTableBody"></tbody>
+          </table>
 
-    </div>
-  </div>
+          <button type="button" class="btn" id="addUserBtn" style="margin-top:14px;">+ Add User</button>
 
-  <!-- ===================== Logs view ===================== -->
-  <div class="view" id="view-logs">
-    <h2 class="section-title">Logs</h2>
-    <div class="panel-card" style="max-width:900px;">
-      <div class="logs-filters">
-        <select id="logsInstanceFilter"><option value="">All instances</option></select>
-        <select id="logsLevelFilter">
-          <option value="">All levels</option>
-          <option value="error">Error</option>
-          <option value="warn">Warn</option>
-          <option value="info">Info</option>
-        </select>
-      </div>
-      <div id="logsEmpty" class="empty-state" style="display:none;">No log entries yet.</div>
-      <div class="logs-list" id="logsList"></div>
-    </div>
-    <div class="stat-sub" style="max-width:900px;">
-      A heartbeat check runs every 30 seconds per instance and logs its current
-      Good/Warn/Critical status here, alongside every scrape error and every
-      alert transition. Kept for 3 days. The full detail (including routine
-      successful scrapes) also goes to <code>vps_monitor.log</code> on disk.
-    </div>
-  </div>
-
-  <!-- ===================== Users view (admin only) ===================== -->
-  <div class="view" id="view-users">
-    <h2 class="section-title">Users</h2>
-    <div class="panel-card" style="max-width:760px;">
-      <table class="subs-table" id="usersTable">
-        <thead><tr><th>#</th><th>Username</th><th>Role</th><th>Status</th><th>Last login</th><th></th></tr></thead>
-        <tbody id="usersTableBody"></tbody>
-      </table>
-
-      <button type="button" class="btn" id="addUserBtn" style="margin-top:14px;">+ Add User</button>
-
-      <form id="addUserForm" style="display:none; margin-top:14px;">
-        <div class="field">
-          <label>Username</label>
-          <input type="text" id="newUserName" placeholder="3-32 chars: letters, digits, . _ -" autocomplete="off" required>
+          <form id="addUserForm" style="display:none; margin-top:14px;">
+            <div class="field">
+              <label>Username</label>
+              <input type="text" id="newUserName" placeholder="3-32 chars: letters, digits, . _ -" autocomplete="off" required>
+            </div>
+            <div class="field">
+              <label>Password</label>
+              <input type="password" id="newUserPass" placeholder="at least 8 characters" autocomplete="new-password" required>
+            </div>
+            <div class="field">
+              <label>Role</label>
+              <select id="newUserRole">
+                <option value="viewer">viewer - read-only access</option>
+                <option value="admin">admin - full control</option>
+              </select>
+            </div>
+            <button type="submit" class="btn">Create User</button>
+            <button type="button" class="btn" id="cancelUserBtn" style="background:var(--border); color:var(--text);">Cancel</button>
+            <div class="form-msg" id="userMsg"></div>
+          </form>
         </div>
-        <div class="field">
-          <label>Password</label>
-          <input type="password" id="newUserPass" placeholder="at least 8 characters" autocomplete="new-password" required>
+        <div class="stat-sub" style="max-width:760px;">
+          <strong>admin</strong> can change anything: instances, thresholds, alert recipients and users.
+          <strong>viewer</strong> can only look at dashboards, health checks and logs &mdash; every
+          mutating request from a viewer is rejected by the server, not just hidden in the page.
+          The last remaining admin account cannot be demoted, disabled or deleted, so you can never
+          lock yourself out.
         </div>
-        <div class="field">
-          <label>Role</label>
-          <select id="newUserRole">
-            <option value="viewer">viewer - read-only access</option>
-            <option value="admin">admin - full control</option>
-          </select>
-        </div>
-        <button type="submit" class="btn">Create User</button>
-        <button type="button" class="btn" id="cancelUserBtn" style="background:var(--border); color:var(--text);">Cancel</button>
-        <div class="form-msg" id="userMsg"></div>
-      </form>
     </div>
-    <div class="stat-sub" style="max-width:760px;">
-      <strong>admin</strong> can change anything: instances, thresholds, alert recipients and users.
-      <strong>viewer</strong> can only look at dashboards, health checks and logs &mdash; every
-      mutating request from a viewer is rejected by the server, not just hidden in the page.
-      The last remaining admin account cannot be demoted, disabled or deleted, so you can never
-      lock yourself out.
-    </div>
-  </div>
-
-  <!-- ===================== Audit log view (admin only) ===================== -->
-  <div class="view" id="view-audit">
-    <h2 class="section-title">Audit Log</h2>
-    <div class="panel-card" style="max-width:900px;">
-      <div class="logs-filters">
-        <select id="auditActionFilter"><option value="">All actions</option></select>
-      </div>
-      <div id="auditEmpty" class="empty-state" style="display:none;">No audit entries yet.</div>
-      <div class="logs-list" id="auditList"></div>
-    </div>
-    <div class="stat-sub" style="max-width:900px;">
-      Who did what: sign-ins (successful, failed and throttled), and every change to
-      instances, thresholds, alert recipients and user accounts &mdash; with the account
-      and IP address that made the change. Kept for 90 days.
-    </div>
-  </div>
-
-  <!-- ===================== My account view ===================== -->
-  <div class="view" id="view-account">
-    <h2 class="section-title">My Account</h2>
-    <div class="panel-card" style="max-width:480px;">
-      <h3 id="accountWhoami">Signed in</h3>
-      <form id="passwordForm">
-        <div class="field">
-          <label>Current password</label>
-          <input type="password" id="curPassword" autocomplete="current-password" required>
+    <div class="subview" id="sub-config-audit">
+        <h2 class="section-title">Audit Log</h2>
+        <div class="panel-card" style="max-width:900px;">
+          <div class="logs-filters">
+            <select id="auditActionFilter"><option value="">All actions</option></select>
+          </div>
+          <div id="auditEmpty" class="empty-state" style="display:none;">No audit entries yet.</div>
+          <div class="logs-list" id="auditList"></div>
         </div>
-        <div class="field">
-          <label>New password</label>
-          <input type="password" id="newPassword" placeholder="at least 8 characters" autocomplete="new-password" required>
+        <div class="stat-sub" style="max-width:900px;">
+          Who did what: sign-ins (successful, failed and throttled), and every change to
+          instances, thresholds, alert recipients and user accounts &mdash; with the account
+          and IP address that made the change. Kept for 90 days.
         </div>
-        <div class="field">
-          <label>Confirm new password</label>
-          <input type="password" id="newPassword2" autocomplete="new-password" required>
+    </div>
+    <div class="subview" id="sub-config-logs">
+        <h2 class="section-title">Logs</h2>
+        <div class="panel-card" style="max-width:900px;">
+          <div class="logs-filters">
+            <select id="logsInstanceFilter"><option value="">All instances</option></select>
+            <select id="logsLevelFilter">
+              <option value="">All levels</option>
+              <option value="error">Error</option>
+              <option value="warn">Warn</option>
+              <option value="info">Info</option>
+            </select>
+          </div>
+          <div id="logsEmpty" class="empty-state" style="display:none;">No log entries yet.</div>
+          <div class="logs-list" id="logsList"></div>
         </div>
-        <button type="submit" class="btn">Change Password</button>
-        <div class="form-msg" id="passwordMsg"></div>
-      </form>
+        <div class="stat-sub" style="max-width:900px;">
+          A heartbeat check runs every 30 seconds per instance and logs its current
+          Good/Warn/Critical status here, alongside every scrape error and every
+          alert transition. Kept for 3 days. The full detail (including routine
+          successful scrapes) also goes to <code>vps_monitor.log</code> on disk.
+        </div>
+    </div>
+    <div class="subview" id="sub-config-account">
+        <h2 class="section-title">My Account</h2>
+        <div class="panel-card" style="max-width:480px;">
+          <h3 id="accountWhoami">Signed in</h3>
+          <form id="passwordForm">
+            <div class="field">
+              <label>Current password</label>
+              <input type="password" id="curPassword" autocomplete="current-password" required>
+            </div>
+            <div class="field">
+              <label>New password</label>
+              <input type="password" id="newPassword" placeholder="at least 8 characters" autocomplete="new-password" required>
+            </div>
+            <div class="field">
+              <label>Confirm new password</label>
+              <input type="password" id="newPassword2" autocomplete="new-password" required>
+            </div>
+            <button type="submit" class="btn">Change Password</button>
+            <div class="form-msg" id="passwordMsg"></div>
+          </form>
+        </div>
     </div>
   </div>
 
@@ -754,22 +922,71 @@ document.getElementById('hamburgerBtn').addEventListener('click', openSidebar);
 document.getElementById('sidebarClose').addEventListener('click', closeSidebar);
 overlay.addEventListener('click', closeSidebar);
 
-function showView(name) {
+// Two-level navigation: six main sections in the sidebar, each with its own
+// row of sub-tabs. SECTION_TITLES drives the heading in the top bar.
+const SECTION_TITLES = {
+  main: 'Main Monitor',
+  vps: 'VPS Monitor',
+  web: 'Web Monitor',
+  ip: 'IP Monitor',
+  notify: 'Notification and Alert',
+  config: 'Configuration and Account',
+};
+
+// What to (re)load when a given sub-tab becomes visible.
+const SUBTAB_LOADERS = {
+  'vps-list': () => renderSelectList(),
+  'vps-add': () => renderManageList(),
+  'vps-health': () => renderHealthChecks(),
+  'notify-add': () => renderAlertsForm(),
+  'notify-list': () => refreshSubscriptions(),
+  'config-thresholds': () => renderAlertsForm(),
+  'config-users': () => refreshUsers(),
+  'config-audit': () => refreshAudit(),
+  'config-logs': () => refreshLogs(),
+  'config-account': () => renderAccount(),
+};
+
+function showView(name, subtab) {
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('view-' + name).classList.add('active');
+  const view = document.getElementById('view-' + name);
+  if (!view) return;
+  view.classList.add('active');
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view === name));
-  if (name === 'instances') renderManageList();
-  if (name === 'select') renderSelectList();
-  if (name === 'health') renderHealthChecks();
-  if (name === 'alerts') renderAlertsForm();
-  if (name === 'logs') refreshLogs();
-  if (name === 'users') refreshUsers();
-  if (name === 'audit') refreshAudit();
-  if (name === 'account') renderAccount();
+
+  const titleEl = document.getElementById('sectionTitle');
+  const dot = document.getElementById('statusDot');
+  titleEl.textContent = '';
+  titleEl.appendChild(dot);
+  titleEl.appendChild(document.createTextNode(SECTION_TITLES[name] || ''));
+
+  // Activate the requested sub-tab, or whichever one is already marked active.
+  const tabs = view.querySelectorAll('.subtab');
+  if (tabs.length) {
+    let target = subtab;
+    if (!target) {
+      const current = view.querySelector('.subtab.active');
+      target = current ? current.dataset.sub : tabs[0].dataset.sub;
+    }
+    showSubTab(view, target);
+  } else if (name === 'main') {
+    renderMainMonitor();
+  }
+}
+
+function showSubTab(view, sub) {
+  view.querySelectorAll('.subtab').forEach(t => t.classList.toggle('active', t.dataset.sub === sub));
+  view.querySelectorAll('.subview').forEach(s => s.classList.toggle('active', s.id === 'sub-' + sub));
+  const load = SUBTAB_LOADERS[sub];
+  if (load) load();
 }
 
 document.querySelectorAll('.nav-btn').forEach(btn => {
   btn.addEventListener('click', () => { showView(btn.dataset.view); closeSidebar(); });
+});
+
+document.querySelectorAll('.subtab').forEach(tab => {
+  tab.addEventListener('click', () => showSubTab(tab.closest('.view'), tab.dataset.sub));
 });
 
 // ---------------------------------------------------------------------------
@@ -933,21 +1150,19 @@ async function loadInstances() {
   document.getElementById('dashboardEmpty').style.display = instances.length ? 'none' : 'block';
   document.getElementById('dashboardBody').style.display = instances.length ? 'block' : 'none';
 
-  const activeView = document.querySelector('.view.active').id;
-  if (activeView === 'view-instances') renderManageList();
-  if (activeView === 'view-select') renderSelectList();
-  if (activeView === 'view-health') renderHealthChecks();
-  if (activeView === 'view-logs') refreshLogs();
+  // Refresh whichever sub-view is currently on screen.
+  const activeSub = document.querySelector('.view.active .subview.active');
+  if (activeSub) {
+    const key = activeSub.id.replace(/^sub-/, '');
+    if (['vps-list', 'vps-add', 'vps-health', 'config-logs'].includes(key)) {
+      const load = SUBTAB_LOADERS[key];
+      if (load) load();
+    }
+  }
+  if (document.getElementById('view-main').classList.contains('active')) renderMainMonitor();
 }
 
 function updateTopbar() {
-  const inst = instances.find(i => i.id === currentInstanceId);
-  document.getElementById('topbarSubtitle').textContent = inst
-    ? `${inst.name} · ${inst.target_url} · refreshes every 10s`
-    : 'No instance selected';
-  document.getElementById('topbarSeverity').innerHTML =
-    inst ? instanceSeverityPillHtml(inst) : '';
-
   const switcher = document.getElementById('topbarInstanceSelect');
   if (!instances.length) {
     switcher.innerHTML = '<option value="">No instances</option>';
@@ -972,9 +1187,165 @@ function selectInstance(id) {
   loadThresholds();
   refreshLatest();
   refreshHistory();
-  showView('dashboard');
+  // Jump to Main Monitor focused on this target.
+  mainType = 'vps';
+  mainTargetId = id;
+  document.getElementById('mainTypeSelect').value = 'vps';
+  showView('main');
+  renderMainMonitor();
   closeSidebar();
 }
+
+// ---------------------------------------------------------------------------
+// Main Monitor: pick a monitor type, then either one target or the overall
+// status of every target of that type.
+// ---------------------------------------------------------------------------
+let mainType = 'vps';
+let mainTargetId = null;   // null = show the "all" overview
+
+function renderMainMonitor() {
+  const typeSel = document.getElementById('mainTypeSelect');
+  const targetSel = document.getElementById('mainTargetSelect');
+  const unavailable = document.getElementById('mainUnavailable');
+  const overview = document.getElementById('mainOverview');
+  const detail = document.getElementById('mainDetail');
+
+  mainType = typeSel.value;
+
+  if (mainType !== 'vps') {
+    const label = mainType === 'web' ? 'Website' : 'IP address';
+    targetSel.innerHTML = '<option value="">All &mdash; overall status</option>';
+    targetSel.disabled = true;
+    unavailable.style.display = 'block';
+    unavailable.innerHTML = `<div style="font-size:15px; color:var(--text); margin-bottom:6px;">`
+      + `${label} monitoring is not wired up yet</div>`
+      + `The section exists so the layout is settled, but nothing is being checked yet.`;
+    overview.style.display = 'none';
+    detail.style.display = 'none';
+    return;
+  }
+
+  targetSel.disabled = false;
+  unavailable.style.display = 'none';
+
+  const keep = mainTargetId;
+  targetSel.innerHTML = '<option value="">All &mdash; overall status</option>'
+    + instances.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
+  targetSel.value = keep && instances.find(i => i.id === keep) ? String(keep) : '';
+  mainTargetId = targetSel.value ? parseInt(targetSel.value, 10) : null;
+
+  if (mainTargetId === null) {
+    overview.style.display = 'block';
+    detail.style.display = 'none';
+    renderOverview();
+  } else {
+    overview.style.display = 'none';
+    detail.style.display = 'block';
+    if (mainTargetId !== currentInstanceId) {
+      currentInstanceId = mainTargetId;
+      localStorage.setItem('vpsmon_instance_id', mainTargetId);
+      updateTopbar();
+      resetCharts();
+      loadThresholds();
+      refreshHistory();
+    }
+    renderDetailHeader();
+    refreshLatest();
+  }
+}
+
+function renderDetailHeader() {
+  const inst = instances.find(i => i.id === mainTargetId);
+  if (!inst) return;
+  document.getElementById('detailName').innerHTML =
+    escapeHtml(inst.name)
+    + (inst.has_auth ? ' <span class="auth-badge" title="Basic Auth configured">AUTH</span>' : '')
+    + instanceSeverityPillHtml(inst);
+  document.getElementById('detailInfo').textContent =
+    `${inst.target_url} · refreshes every 10s`;
+}
+
+function renderOverview() {
+  const grid = document.getElementById('overviewGrid');
+  const empty = document.getElementById('overviewEmpty');
+  if (!instances.length) {
+    empty.style.display = 'block';
+    empty.innerHTML = 'No VPS added yet. Add one under <strong>VPS Monitor &rarr; Add / Edit VPS</strong>.';
+    grid.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  grid.innerHTML = instances.map(inst => {
+    const sev = (inst.severity && inst.severity.overall) || null;
+    const down = inst.last_status === 'error';
+    const failing = healthFailingCount(inst);
+    const cls = down ? 'down' : (sev === 'critical' ? 'critical' : (sev === 'warn' ? 'warn' : ''));
+
+    let note = '';
+    if (down) {
+      note = `<div class="overview-note" style="color:var(--bad);">Unreachable &mdash; `
+           + `${escapeHtml((inst.last_error || 'no response').slice(0, 90))}</div>`;
+    } else if (failing) {
+      note = `<div class="overview-note" style="color:var(--bad);">`
+           + `${failing} health check${failing > 1 ? 's' : ''} failing</div>`;
+    } else if (inst.last_status === 'ok') {
+      note = `<div class="overview-note" style="color:var(--ok);">All checks passing</div>`;
+    } else {
+      note = `<div class="overview-note" style="color:var(--muted);">Waiting for first scrape…</div>`;
+    }
+
+    const m = overviewMetrics[inst.id] || {};
+    const metric = (k, v) => `<div class="overview-metric"><div class="k">${k}</div>`
+                            + `<div class="v">${v}</div></div>`;
+    const pct = v => (v === null || v === undefined) ? '--' : v + '%';
+
+    return `<div class="overview-card ${cls}" data-id="${inst.id}">
+      <div class="overview-name">${escapeHtml(inst.name)}${instanceSeverityPillHtml(inst)}</div>
+      <div class="overview-sub">${escapeHtml(inst.target_url)}</div>
+      <div class="overview-metrics">
+        ${metric('CPU', down ? '--' : pct(m.cpu_percent))}
+        ${metric('Memory', down ? '--' : pct(m.mem_percent))}
+        ${metric('Disk', down ? '--' : pct(m.disk_percent))}
+      </div>
+      ${note}
+    </div>`;
+  }).join('');
+
+  grid.querySelectorAll('.overview-card').forEach(card => {
+    card.addEventListener('click', () => {
+      mainTargetId = parseInt(card.dataset.id, 10);
+      document.getElementById('mainTargetSelect').value = String(mainTargetId);
+      renderMainMonitor();
+    });
+  });
+}
+
+// Latest sample per instance, used only by the overview cards.
+let overviewMetrics = {};
+async function loadOverviewMetrics() {
+  if (!document.getElementById('view-main').classList.contains('active')) return;
+  if (mainType !== 'vps' || mainTargetId !== null) return;
+  const results = await Promise.all(instances.map(async i => {
+    try {
+      const r = await apiFetch('/api/metrics/latest?instance_id=' + i.id);
+      return [i.id, await r.json()];
+    } catch (e) { return [i.id, null]; }
+  }));
+  overviewMetrics = Object.fromEntries(results.filter(([, v]) => v).map(([k, v]) => [k, v]));
+  renderOverview();
+}
+
+document.getElementById('mainTypeSelect').addEventListener('change', () => {
+  mainTargetId = null;
+  renderMainMonitor();
+  loadOverviewMetrics();
+});
+document.getElementById('mainTargetSelect').addEventListener('change', (e) => {
+  mainTargetId = e.target.value ? parseInt(e.target.value, 10) : null;
+  renderMainMonitor();
+  if (mainTargetId === null) loadOverviewMetrics();
+});
 
 function resetCharts() {
   [cpuChart, memChart, diskChart, bwChart, diskioChart, netChart].forEach(c => {
@@ -1086,7 +1457,7 @@ function startEditInstance(inst) {
   document.getElementById('instFormSubmitBtn').textContent = 'Save Changes';
   document.getElementById('instFormCancelBtn').style.display = 'inline-block';
   document.getElementById('addInstMsg').textContent = '';
-  showView('instances');
+  showView('vps', 'vps-add');
 }
 
 function cancelEditInstance() {
@@ -1219,6 +1590,7 @@ function renderSubscriptions() {
   body.innerHTML = subscriptions.map((s, i) => `
     <tr>
       <td>${i + 1}</td>
+      <td><span class="role-badge viewer">VPS</span></td>
       <td>${escapeHtml(s.instance_name || instanceNameFor(s.instance_id))}</td>
       <td>${escapeHtml(s.email)}</td>
       <td>${escapeHtml(ALERT_TYPE_LABEL[s.alert_type] || s.alert_type)}</td>
@@ -1232,17 +1604,6 @@ function renderSubscriptions() {
   });
 }
 
-document.getElementById('addSubBtn').addEventListener('click', () => {
-  document.getElementById('subInstance').value = threshInstanceId ?? (instances[0] && instances[0].id);
-  document.getElementById('addSubForm').style.display = 'block';
-  document.getElementById('addSubBtn').style.display = 'none';
-});
-document.getElementById('cancelSubBtn').addEventListener('click', () => {
-  document.getElementById('addSubForm').reset();
-  document.getElementById('addSubForm').style.display = 'none';
-  document.getElementById('addSubBtn').style.display = 'inline-block';
-  document.getElementById('subMsg').textContent = '';
-});
 document.getElementById('addSubForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const msg = document.getElementById('subMsg');
@@ -1261,11 +1622,11 @@ document.getElementById('addSubForm').addEventListener('submit', async (e) => {
   const data = await res.json().catch(() => ({}));
   if (res.ok) {
     document.getElementById('addSubForm').reset();
-    document.getElementById('addSubForm').style.display = 'none';
-    document.getElementById('addSubBtn').style.display = 'inline-block';
     await refreshSubscriptions();
+    msg.textContent = 'Alert added. See it under the Alert List tab.';
+    msg.className = 'form-msg ok';
   } else {
-    msg.textContent = data.error || 'Failed to add subscription.';
+    msg.textContent = data.error || 'Failed to add alert.';
     msg.className = 'form-msg error';
   }
 });
@@ -1729,11 +2090,14 @@ document.getElementById('rangeSelect').addEventListener('change', (e) => {
   await loadMe();
   await loadInstances();
   await loadThresholds();
+  showView('main');
+  await loadOverviewMetrics();
   refreshLatest();
   refreshHistory();
   setInterval(refreshLatest, 5000);
   setInterval(refreshHistory, 10000);
   setInterval(loadInstances, 10000);
+  setInterval(loadOverviewMetrics, 10000);
 })();
 </script>
 
