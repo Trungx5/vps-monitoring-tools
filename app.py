@@ -172,6 +172,25 @@ WEB_CHECK_DEFS = {
 WEB_CERT_WARN_DAYS = 21        # cert_fresh fails below this
 WEB_SLOW_MS_DEFAULT = 5000     # speed fails above this unless overridden
 
+# --- IP / host reachability ------------------------------------------------
+IP_CHECK_INTERVAL_SECONDS = int(os.environ.get("IP_CHECK_INTERVAL_SECONDS", "60"))
+IP_SLOW_MS_DEFAULT = 300       # latency check fails above this unless overridden
+IP_CHECK_RETENTION_DAYS = 30
+
+IP_ALERT_TYPE_LABELS = {
+    "ip_down": "Host unreachable",
+    "ip_slow": "High latency",
+    "ip_changed": "Resolved IP address changed",
+    "ip_port_closed": "Port not accepting connections",
+}
+
+IP_CHECK_DEFS = {
+    "reachable": "Host responding",
+    "latency": "Latency acceptable",
+    "ip_stable": "Resolved IP unchanged",
+    "port_open": "Port accepting connections",
+}
+
 app = Flask(__name__)
 # A per-process random fallback is fine for single-process development, but
 # fatal with multiple workers: each would sign cookies with a different key and
@@ -683,6 +702,37 @@ def _init_db_once():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_web_checks_target ON web_checks(target_id, id)")
+
+    # --- IP / host monitoring ----------------------------------------------
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ip_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT NOT NULL UNIQUE,
+            method TEXT NOT NULL DEFAULT 'ping',
+            port INTEGER,
+            slow_ms INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            last_status TEXT,
+            last_error TEXT,
+            last_checked_at TEXT,
+            last_ip TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ip_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            ok INTEGER,
+            latency_ms REAL,
+            resolved_ip TEXT,
+            port_open INTEGER,
+            error TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ip_checks_target ON ip_checks(target_id, id)")
     conn.commit()
 
     # INSERT OR IGNORE rather than check-then-insert: two services starting
@@ -944,7 +994,8 @@ def get_thresholds(instance_id):
 
 
 def alert_label_for(alert_type):
-    return ALERT_TYPE_LABELS.get(alert_type) or WEB_ALERT_TYPE_LABELS.get(alert_type) or alert_type
+    return (ALERT_TYPE_LABELS.get(alert_type) or WEB_ALERT_TYPE_LABELS.get(alert_type)
+            or IP_ALERT_TYPE_LABELS.get(alert_type) or alert_type)
 
 
 def get_subscriptions(instance_id):
@@ -982,21 +1033,25 @@ def get_all_subscriptions():
     rows = conn.execute("""
         SELECT s.*,
                i.name AS vps_name, i.target_url AS vps_url,
-               w.name AS web_name, w.url AS web_url
+               w.name AS web_name, w.url AS web_url,
+               p.name AS ip_name, p.address AS ip_addr
         FROM alert_subscriptions s
         LEFT JOIN instances   i ON i.id = s.instance_id AND s.monitor_type = 'vps'
         LEFT JOIN web_targets w ON w.id = s.instance_id AND s.monitor_type = 'web'
+        LEFT JOIN ip_targets  p ON p.id = s.instance_id AND s.monitor_type = 'ip'
         ORDER BY s.id
     """).fetchall()
     conn.close()
     subs = []
     for r in rows:
         s = dict(r)
-        is_web = s.get("monitor_type") == "web"
-        s["target_name"] = (s.pop("web_name") if is_web else s.pop("vps_name")) or f"#{s['instance_id']}"
-        s["target_url"] = (s.pop("web_url") if is_web else s.pop("vps_url")) or ""
-        s.pop("web_name", None); s.pop("vps_name", None)
-        s.pop("web_url", None); s.pop("vps_url", None)
+        mt = s.get("monitor_type")
+        names = {"web": s.pop("web_name", None), "ip": s.pop("ip_name", None),
+                 "vps": s.pop("vps_name", None)}
+        urls = {"web": s.pop("web_url", None), "ip": s.pop("ip_addr", None),
+                "vps": s.pop("vps_url", None)}
+        s["target_name"] = names.get(mt) or f"#{s['instance_id']}"
+        s["target_url"] = urls.get(mt) or ""
         s["instance_name"] = s["target_name"]          # kept for the existing UI
         s["alert_type_label"] = alert_label_for(s["alert_type"])
         subs.append(s)
@@ -1637,6 +1692,44 @@ def maybe_alert_web(target, health, subscriptions, latest):
             send_alert_email(email, subject, body)
 
 
+def get_web_stats(target_id, seconds):
+    """Uptime and latency summary over a window. Computed from the checks
+    already stored, so no extra polling is involved."""
+    cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+    conn = db()
+    rows = conn.execute(
+        "SELECT ok, response_ms FROM web_checks WHERE target_id = ? AND timestamp >= ?",
+        (target_id, cutoff)
+    ).fetchall()
+    conn.close()
+
+    total = len(rows)
+    if not total:
+        return {"checks": 0, "uptime_pct": None, "up": 0, "down": 0,
+                "avg_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
+
+    up = sum(1 for r in rows if r["ok"])
+    # Latency is only meaningful for checks that actually got a response.
+    times = sorted(r["response_ms"] for r in rows if r["ok"] and r["response_ms"] is not None)
+
+    def pct(p):
+        if not times:
+            return None
+        k = min(int(round((p / 100) * (len(times) - 1))), len(times) - 1)
+        return round(times[k], 1)
+
+    return {
+        "checks": total,
+        "up": up,
+        "down": total - up,
+        "uptime_pct": round(up / total * 100, 3),
+        "avg_ms": round(sum(times) / len(times), 1) if times else None,
+        "p50_ms": pct(50),
+        "p95_ms": pct(95),
+        "max_ms": round(times[-1], 1) if times else None,
+    }
+
+
 def trim_web_checks():
     cutoff = (utcnow() - timedelta(days=WEB_CHECK_RETENTION_DAYS)).isoformat()
     conn = db()
@@ -1678,6 +1771,273 @@ def web_check_loop():
                 logger.error(f"web check failed for {target['name']}: {e}")
         trim_web_checks()
         time.sleep(WEB_CHECK_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# IP / host monitoring
+#
+# Two methods, because they answer different questions:
+#   tcp  - can something actually connect to this port? Works unprivileged and
+#          proves a service is listening, not just that the box is powered on.
+#   ping - ICMP echo. Says the host is alive but nothing about its services,
+#          and plenty of hosts (and most cloud firewalls) drop ICMP entirely.
+# ---------------------------------------------------------------------------
+def get_ip_targets():
+    conn = db()
+    rows = conn.execute("SELECT * FROM ip_targets ORDER BY id").fetchall()
+    conn.close()
+    targets = [dict(r) for r in rows]
+    for t in targets:
+        t["health"] = evaluate_ip_health(t, get_ip_latest(t["id"]))
+        t["severity"] = {"overall": ip_overall_severity(t)}
+    return targets
+
+
+def get_ip_target(target_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM ip_targets WHERE id = ?", (target_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_ip_latest(target_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM ip_checks WHERE target_id = ? ORDER BY id DESC LIMIT 1", (target_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_ip_history(target_id, seconds=None, limit=200):
+    conn = db()
+    if seconds:
+        cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+        rows = conn.execute(
+            "SELECT * FROM ip_checks WHERE target_id = ? AND timestamp >= ? ORDER BY id ASC",
+            (target_id, cutoff)
+        ).fetchall()
+    else:
+        rows = list(reversed(conn.execute(
+            "SELECT * FROM ip_checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
+            (target_id, limit)
+        ).fetchall()))
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_ip_stats(target_id, seconds):
+    cutoff = (utcnow() - timedelta(seconds=seconds)).isoformat()
+    conn = db()
+    rows = conn.execute(
+        "SELECT ok, latency_ms FROM ip_checks WHERE target_id = ? AND timestamp >= ?",
+        (target_id, cutoff)
+    ).fetchall()
+    conn.close()
+    total = len(rows)
+    if not total:
+        return {"checks": 0, "uptime_pct": None, "up": 0, "down": 0,
+                "avg_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
+    up = sum(1 for r in rows if r["ok"])
+    times = sorted(r["latency_ms"] for r in rows if r["ok"] and r["latency_ms"] is not None)
+
+    def pct(p):
+        if not times:
+            return None
+        k = min(int(round((p / 100) * (len(times) - 1))), len(times) - 1)
+        return round(times[k], 1)
+
+    return {"checks": total, "up": up, "down": total - up,
+            "uptime_pct": round(up / total * 100, 3),
+            "avg_ms": round(sum(times) / len(times), 1) if times else None,
+            "p50_ms": pct(50), "p95_ms": pct(95),
+            "max_ms": round(times[-1], 1) if times else None}
+
+
+def _ping_once(host, timeout_s=3):
+    """Returns latency in ms, or None. Uses the system ping so it works without
+    the raw-socket privileges an in-process ICMP implementation would need."""
+    import platform
+    import subprocess
+    windows = platform.system().lower().startswith("win")
+    cmd = (["ping", "-n", "1", "-w", str(int(timeout_s * 1000)), host] if windows
+           else ["ping", "-c", "1", "-W", str(int(timeout_s)), host])
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 3)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = re.search(r'time[=<]\s*([\d.]+)\s*ms', proc.stdout, re.I)
+    if m:
+        return round(float(m.group(1)), 2)
+    return round((time.monotonic() - started) * 1000, 2)
+
+
+def check_ip_target(target):
+    result = {"target_id": target["id"], "timestamp": utcnow().isoformat(), "ok": 0,
+              "latency_ms": None, "resolved_ip": None, "port_open": None, "error": None}
+    address = target["address"]
+
+    try:
+        result["resolved_ip"] = socket.gethostbyname(address)
+    except Exception as e:
+        result["error"] = f"DNS lookup failed: {e}"
+        return result
+
+    if target.get("method") == "tcp":
+        port = target.get("port") or 443
+        started = time.monotonic()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        try:
+            sock.connect((result["resolved_ip"], port))
+            result["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+            result["port_open"] = 1
+            result["ok"] = 1
+        except Exception as e:
+            result["port_open"] = 0
+            result["error"] = f"port {port}: {type(e).__name__}"
+        finally:
+            sock.close()
+    else:
+        latency = _ping_once(address)
+        if latency is None:
+            result["error"] = "no ICMP reply (host down, or ICMP blocked)"
+        else:
+            result["latency_ms"] = latency
+            result["ok"] = 1
+    return result
+
+
+def save_ip_check(result):
+    conn = db()
+    conn.execute("""
+        INSERT INTO ip_checks (target_id, timestamp, ok, latency_ms, resolved_ip, port_open, error)
+        VALUES (:target_id, :timestamp, :ok, :latency_ms, :resolved_ip, :port_open, :error)
+    """, result)
+    conn.commit()
+    conn.close()
+
+
+def evaluate_ip_health(target, latest):
+    checks = {k: None for k in IP_CHECK_DEFS}
+    if not latest:
+        return checks
+    checks["reachable"] = bool(latest.get("ok"))
+    slow = target.get("slow_ms") or IP_SLOW_MS_DEFAULT
+    if latest.get("latency_ms") is not None:
+        checks["latency"] = latest["latency_ms"] <= slow
+    if target.get("last_ip") and latest.get("resolved_ip"):
+        checks["ip_stable"] = target["last_ip"] == latest["resolved_ip"]
+    if latest.get("port_open") is not None:
+        checks["port_open"] = bool(latest["port_open"])
+    return checks
+
+
+def ip_overall_severity(target):
+    h = target.get("health") or {}
+    if h.get("reachable") is False or h.get("port_open") is False:
+        return "critical"
+    if False in (h.get("latency"), h.get("ip_stable")):
+        return "warn"
+    if any(v is True for v in h.values()):
+        return "good"
+    return None
+
+
+_prev_ip_health = {}
+IP_CHECK_ALERT = {
+    "reachable": "ip_down",
+    "latency": "ip_slow",
+    "ip_stable": "ip_changed",
+    "port_open": "ip_port_closed",
+}
+
+
+def get_subscriptions_for_ip(target_id):
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'ip' ORDER BY id",
+        (target_id,)
+    ).fetchall()
+    conn.close()
+    subs = [dict(r) for r in rows]
+    for s in subs:
+        s["alert_type_label"] = alert_label_for(s["alert_type"])
+    return subs
+
+
+def maybe_alert_ip(target, health, subscriptions, latest):
+    tid = target["id"]
+    previous = _prev_ip_health.get(tid, {})
+    _prev_ip_health[tid] = dict(health)
+
+    for key, val in health.items():
+        old = previous.get(key)
+        if val is None or old == val:
+            continue
+        if old is None and val is True:
+            continue
+
+        alert_type = IP_CHECK_ALERT[key]
+        label = IP_ALERT_TYPE_LABELS[alert_type]
+        log_event("info" if val else "error", "ip",
+                  f"{IP_CHECK_DEFS[key]}: {'OK' if val else 'FAILING'}", None, target["name"])
+
+        detail = ""
+        if key == "ip_stable" and latest:
+            detail = f" ({target.get('last_ip')} -> {latest.get('resolved_ip')})"
+        elif key == "latency" and latest and latest.get("latency_ms") is not None:
+            detail = f" ({latest['latency_ms']:.0f} ms)"
+        elif latest and latest.get("error"):
+            detail = f" ({latest['error']})"
+
+        for email in emails_for_alert_type(subscriptions, alert_type):
+            state = "recovered" if val else "FAILING"
+            subject = f"[VPS Monitor] {target['name']}: {label} - {state}"
+            body = (f"{target['name']} ({target['address']}): "
+                    f"{IP_CHECK_DEFS[key]} is {'OK again' if val else 'FAILING'}{detail}.")
+            send_alert_email(email, subject, body)
+
+
+def trim_ip_checks():
+    cutoff = (utcnow() - timedelta(days=IP_CHECK_RETENTION_DAYS)).isoformat()
+    conn = db()
+    conn.execute("DELETE FROM ip_checks WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+def ip_check_loop():
+    while True:
+        for target in get_ip_targets():
+            if not target.get("enabled"):
+                continue
+            tid = target["id"]
+            try:
+                result = check_ip_target(target)
+                save_ip_check(result)
+                conn = db()
+                conn.execute(
+                    "UPDATE ip_targets SET last_status=?, last_error=?, last_checked_at=?, last_ip=? "
+                    "WHERE id=?",
+                    ("ok" if result["ok"] else "error", result["error"],
+                     result["timestamp"], result["resolved_ip"], tid)
+                )
+                conn.commit()
+                conn.close()
+                logger.info(f"[ip:{target['name']}] {'up' if result['ok'] else 'DOWN'} "
+                            f"{result['latency_ms'] or '-'}ms ip={result['resolved_ip'] or '-'}")
+
+                fresh = get_ip_target(tid)
+                fresh["health"] = evaluate_ip_health(target, result)
+                maybe_alert_ip(fresh, fresh["health"], get_subscriptions_for_ip(tid), result)
+            except Exception as e:
+                logger.error(f"ip check failed for {target['name']}: {e}")
+        trim_ip_checks()
+        time.sleep(IP_CHECK_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -1951,7 +2311,8 @@ def api_thresholds_set():
 @app.route("/api/alert-types")
 def api_alert_types():
     monitor_type = request.args.get("monitor_type", "vps")
-    table = WEB_ALERT_TYPE_LABELS if monitor_type == "web" else ALERT_TYPE_LABELS
+    table = {"web": WEB_ALERT_TYPE_LABELS, "ip": IP_ALERT_TYPE_LABELS}.get(
+        monitor_type, ALERT_TYPE_LABELS)
     return jsonify([{"key": k, "label": v} for k, v in table.items()])
 
 
@@ -2071,6 +2432,148 @@ def api_web_history():
     return jsonify(get_web_history(target_id,
                                     seconds=request.args.get("range_seconds", type=int),
                                     limit=request.args.get("limit", default=200, type=int)))
+
+
+@app.route("/api/web-stats")
+def api_web_stats():
+    target_id = request.args.get("target_id", type=int)
+    if target_id is None:
+        return jsonify({})
+    windows = {"24h": 86400, "7d": 604800, "30d": 2592000}
+    custom = request.args.get("range_seconds", type=int)
+    if custom:
+        windows["window"] = custom
+    return jsonify({k: get_web_stats(target_id, s) for k, s in windows.items()})
+
+
+# ---------------------------------------------------------------------------
+# IP monitoring
+# ---------------------------------------------------------------------------
+@app.route("/api/ip-targets")
+def api_ip_targets_list():
+    targets = get_ip_targets()
+    for t in targets:
+        t["latest"] = get_ip_latest(t["id"])
+    return jsonify(targets)
+
+
+@app.route("/api/ip-targets", methods=["POST"])
+def api_ip_targets_create():
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    address = (data.get("address") or "").strip()
+    method = (data.get("method") or "ping").strip()
+
+    if not name or not address:
+        return jsonify({"error": "name and address are required"}), 400
+    if method not in ("ping", "tcp"):
+        return jsonify({"error": "method must be ping or tcp"}), 400
+
+    def opt_int(k):
+        v = data.get(k)
+        try:
+            return int(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    port = opt_int("port")
+    if method == "tcp" and not port:
+        return jsonify({"error": "a port is required for a TCP check"}), 400
+
+    conn = db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO ip_targets (name, address, method, port, slow_ms, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (name, address, method, port, opt_int("slow_ms"), utcnow().isoformat())
+        )
+        conn.commit()
+        new_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "that address is already being monitored"}), 409
+    conn.close()
+    log_audit("ip.create", target=name, details=f"{address} ({method}{':' + str(port) if port else ''})")
+    return jsonify({"id": new_id, "name": name, "address": address}), 201
+
+
+@app.route("/api/ip-targets/<int:target_id>", methods=["PATCH"])
+def api_ip_targets_update(target_id):
+    data = request.get_json(force=True, silent=True) or {}
+    row = get_ip_target(target_id)
+    if not row:
+        return jsonify({"error": "target not found"}), 404
+
+    name = (data.get("name") or "").strip() or row["name"]
+    address = (data.get("address") or "").strip() or row["address"]
+    method = (data.get("method") or row["method"]).strip()
+    if method not in ("ping", "tcp"):
+        return jsonify({"error": "method must be ping or tcp"}), 400
+
+    def pick(k):
+        if k not in data:
+            return row[k]
+        v = data.get(k)
+        try:
+            return int(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    port = pick("port")
+    if method == "tcp" and not port:
+        return jsonify({"error": "a port is required for a TCP check"}), 400
+
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE ip_targets SET name=?, address=?, method=?, port=?, slow_ms=?, enabled=? WHERE id=?",
+            (name, address, method, port, pick("slow_ms"),
+             1 if data.get("enabled", row["enabled"]) else 0, target_id)
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify({"error": "another target already uses that address"}), 409
+    conn.close()
+    log_audit("ip.update", target=name, details=address)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ip-targets/<int:target_id>", methods=["DELETE"])
+def api_ip_targets_delete(target_id):
+    row = get_ip_target(target_id)
+    conn = db()
+    conn.execute("DELETE FROM ip_targets WHERE id = ?", (target_id,))
+    conn.execute("DELETE FROM ip_checks WHERE target_id = ?", (target_id,))
+    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'ip'",
+                 (target_id,))
+    conn.commit()
+    conn.close()
+    _prev_ip_health.pop(target_id, None)
+    log_audit("ip.delete", target=row["name"] if row else f"id={target_id}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ip-checks/history")
+def api_ip_history():
+    target_id = request.args.get("target_id", type=int)
+    if target_id is None:
+        return jsonify([])
+    return jsonify(get_ip_history(target_id,
+                                   seconds=request.args.get("range_seconds", type=int),
+                                   limit=request.args.get("limit", default=200, type=int)))
+
+
+@app.route("/api/ip-stats")
+def api_ip_stats():
+    target_id = request.args.get("target_id", type=int)
+    if target_id is None:
+        return jsonify({})
+    windows = {"24h": 86400, "7d": 604800, "30d": 2592000}
+    custom = request.args.get("range_seconds", type=int)
+    if custom:
+        windows["window"] = custom
+    return jsonify({k: get_ip_stats(target_id, s) for k, s in windows.items()})
 
 
 # ---------------------------------------------------------------------------
@@ -2238,15 +2741,19 @@ def api_subscriptions_create():
         return jsonify({"error": "a target is required"}), 400
     if not email or not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
         return jsonify({"error": "a valid email is required"}), 400
-    if monitor_type not in ("vps", "web"):
-        return jsonify({"error": "monitor_type must be vps or web"}), 400
+    if monitor_type not in ("vps", "web", "ip"):
+        return jsonify({"error": "monitor_type must be vps, web or ip"}), 400
 
-    valid_types = WEB_ALERT_TYPE_LABELS if monitor_type == "web" else ALERT_TYPE_LABELS
+    valid_types = {"web": WEB_ALERT_TYPE_LABELS, "ip": IP_ALERT_TYPE_LABELS}.get(
+        monitor_type, ALERT_TYPE_LABELS)
     if alert_type not in valid_types:
         return jsonify({"error": f"unknown alert_type for a {monitor_type} monitor"}), 400
 
     if monitor_type == "web":
         target = get_web_target(instance_id)
+        target_name = target["name"] if target else None
+    elif monitor_type == "ip":
+        target = get_ip_target(instance_id)
         target_name = target["name"] if target else None
     else:
         target = next((i for i in get_instances() if i["id"] == instance_id), None)
@@ -2293,4 +2800,5 @@ if __name__ == "__main__":
     threading.Thread(target=scrape_loop, daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=web_check_loop, daemon=True).start()
+    threading.Thread(target=ip_check_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)

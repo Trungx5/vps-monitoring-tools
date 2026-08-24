@@ -614,6 +614,7 @@
     <div class="subtabs">
       <button class="subtab active" data-sub="web-list">All Websites</button>
       <button class="subtab" data-sub="web-add">Add Website</button>
+      <button class="subtab" data-sub="web-stats">Uptime &amp; Charts</button>
     </div>
 
     <div class="subview active" id="sub-web-list">
@@ -672,6 +673,36 @@
         </form>
       </div>
     </div>
+
+    <div class="subview" id="sub-web-stats">
+      <h2 class="section-title">Uptime &amp; Charts</h2>
+      <div class="monitor-picker">
+        <div class="picker-field">
+          <label for="webStatsTarget">Website</label>
+          <select id="webStatsTarget"></select>
+        </div>
+      </div>
+      <div id="webStatsEmpty" class="empty-state" style="display:none; max-width:640px;">
+        No websites monitored yet.
+      </div>
+      <div id="webStatsBody" style="display:none;">
+        <div class="target-header">
+          <div class="target-name" id="webStatsName">&mdash;</div>
+          <div class="target-info" id="webStatsUrl"></div>
+        </div>
+        <div class="grid" id="webUptimeCards"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-title">Response time (ms)</div>
+            <canvas id="webLatencyChart"></canvas>
+          </div>
+          <div class="chart-card">
+            <div class="chart-title">Up / down (1 = up)</div>
+            <canvas id="webUpChart"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- ===================== 4. IP MONITOR (scaffold) ===================== -->
@@ -679,23 +710,92 @@
     <div class="subtabs">
       <button class="subtab active" data-sub="ip-list">All IP Addresses</button>
       <button class="subtab" data-sub="ip-add">Add IP Address</button>
+      <button class="subtab" data-sub="ip-stats">Uptime &amp; Charts</button>
     </div>
+
     <div class="subview active" id="sub-ip-list">
       <h2 class="section-title">All IP Addresses</h2>
-      <div class="empty-state" style="max-width:640px;">
-        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">IP monitoring is not wired up yet</div>
-        The screens are here so the layout is settled, but the checks behind
-        them (ping and port reachability, DNS-to-IP change detection) still need to be built. Nothing is
-        being monitored from this section right now.
+      <div id="ipEmpty" class="empty-state" style="display:none; max-width:640px;">
+        Nothing monitored yet. Add a host from the <strong>Add IP Address</strong> tab.
+      </div>
+      <div class="panel-card" id="ipListCard" style="max-width:1000px; display:none;">
+        <table class="subs-table" id="ipTable">
+          <thead><tr>
+            <th>#</th><th>Name</th><th>Address</th><th>Check</th>
+            <th>Latency</th><th>Resolved IP</th><th>State</th><th></th>
+          </tr></thead>
+          <tbody id="ipTableBody"></tbody>
+        </table>
+      </div>
+      <div class="stat-sub" style="max-width:1000px;">
+        A <strong>TCP</strong> check proves a service is actually listening on a port.
+        A <strong>ping</strong> check only proves the host answers ICMP &mdash; and many
+        firewalls (AWS security groups included) drop ICMP by default, which makes a
+        perfectly healthy server look down. Prefer TCP unless you specifically want ICMP.
       </div>
     </div>
+
     <div class="subview" id="sub-ip-add">
-      <h2 class="section-title">Add IP Address</h2>
-      <div class="empty-state" style="max-width:640px;">
-        <div style="font-size:15px; color:var(--text); margin-bottom:6px;">IP monitoring is not wired up yet</div>
-        The screens are here so the layout is settled, but the checks behind
-        them (ping and port reachability, DNS-to-IP change detection) still need to be built. Nothing is
-        being monitored from this section right now.
+      <h2 class="section-title" id="ipFormTitle">Add IP Address</h2>
+      <div class="panel-card" style="max-width:560px;">
+        <form id="addIpForm">
+          <div class="field">
+            <label>Name</label>
+            <input type="text" id="ipName" placeholder="e.g. Edge router" required>
+          </div>
+          <div class="field">
+            <label>IP address or hostname</label>
+            <input type="text" id="ipAddress" placeholder="8.8.8.8  or  host.example.com" required>
+          </div>
+          <div class="field">
+            <label>Check method</label>
+            <select id="ipMethod">
+              <option value="tcp">TCP port connect (recommended)</option>
+              <option value="ping">ICMP ping</option>
+            </select>
+          </div>
+          <div class="field" id="ipPortField">
+            <label>Port</label>
+            <input type="number" id="ipPort" placeholder="443" value="443">
+          </div>
+          <div class="field">
+            <label>Slow above <span style="color:var(--muted);">(ms, optional)</span></label>
+            <input type="number" id="ipSlowMs" placeholder="default 300">
+          </div>
+          <button type="submit" class="btn" id="ipFormSubmit">Add Target</button>
+          <button type="button" class="btn" id="ipFormCancel" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
+          <div class="form-msg" id="ipMsg"></div>
+        </form>
+      </div>
+    </div>
+
+    <div class="subview" id="sub-ip-stats">
+      <h2 class="section-title">Uptime &amp; Charts</h2>
+      <div class="monitor-picker">
+        <div class="picker-field">
+          <label for="ipStatsTarget">Target</label>
+          <select id="ipStatsTarget"></select>
+        </div>
+      </div>
+      <div id="ipStatsEmpty" class="empty-state" style="display:none; max-width:640px;">
+        Nothing monitored yet.
+      </div>
+      <div id="ipStatsBody" style="display:none;">
+        <div class="target-header">
+          <div class="target-name" id="ipStatsName">&mdash;</div>
+          <div class="target-info" id="ipStatsAddr"></div>
+        </div>
+        <div class="grid" id="ipUptimeCards"></div>
+        <div class="charts-grid">
+          <div class="chart-card">
+            <div class="chart-title">Latency (ms)</div>
+            <canvas id="ipLatencyChart"></canvas>
+          </div>
+          <div class="chart-card">
+            <div class="chart-title">Up / down (1 = up)</div>
+            <canvas id="ipUpChart"></canvas>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -975,6 +1075,9 @@ const SECTION_TITLES = {
 // What to (re)load when a given sub-tab becomes visible.
 const SUBTAB_LOADERS = {
   'web-list': () => refreshWebTargets(),
+  'web-stats': () => renderWebStats(),
+  'ip-list': () => refreshIpTargets(),
+  'ip-stats': () => renderIpStats(),
   'vps-list': () => renderSelectList(),
   'vps-add': () => renderManageList(),
   'vps-health': () => renderHealthChecks(),
@@ -2000,6 +2103,232 @@ async function refreshAudit() {
 }
 
 document.getElementById('auditActionFilter').addEventListener('change', refreshAudit);
+
+// ---------------------------------------------------------------------------
+// Uptime statistics (shared by the website and IP sections)
+// ---------------------------------------------------------------------------
+const statsCharts = {};
+
+function makeStatsChart(canvasId, label, colour) {
+  if (statsCharts[canvasId]) return statsCharts[canvasId];
+  statsCharts[canvasId] = new Chart(document.getElementById(canvasId), {
+    type: 'line',
+    data: { labels: [], datasets: [{ label, data: [], borderColor: colour,
+            backgroundColor: colour + '22', tension: 0.25, pointRadius: 0, fill: true }] },
+    options: { responsive: true, animation: false,
+      scales: { x: { ticks: { color: '#8b91a3', maxTicksLimit: 6 }, grid: { color: '#262a36' } },
+                y: { ticks: { color: '#8b91a3' }, grid: { color: '#262a36' }, beginAtZero: true } },
+      plugins: { legend: { display: false } } }
+  });
+  return statsCharts[canvasId];
+}
+
+function uptimeCardsHtml(stats) {
+  const windows = [['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days']];
+  return windows.map(([k, label]) => {
+    const s = stats[k] || {};
+    const pctVal = s.uptime_pct;
+    const colour = pctVal === null || pctVal === undefined ? 'var(--muted)'
+                 : (pctVal >= 99.5 ? 'var(--ok)' : (pctVal >= 95 ? 'var(--warn)' : 'var(--bad)'));
+    const shown = (pctVal === null || pctVal === undefined) ? '--' : pctVal.toFixed(2) + '%';
+    return `<div class="stat-card">
+      <div class="stat-label">${label}</div>
+      <div class="stat-value" style="color:${colour};">${shown}</div>
+      <div class="stat-sub">${s.checks || 0} checks &middot; ${s.down || 0} failed</div>
+    </div>`;
+  }).join('') + (() => {
+    const s = stats['24h'] || {};
+    const f = v => (v === null || v === undefined) ? '--' : Math.round(v) + ' ms';
+    return `<div class="stat-card">
+      <div class="stat-label">Response time (24h)</div>
+      <div class="stat-value">${f(s.p50_ms)}</div>
+      <div class="stat-sub">p95 ${f(s.p95_ms)} &middot; max ${f(s.max_ms)}</div>
+    </div>`;
+  })();
+}
+
+function fillStatsChart(chart, rows, valueKey, labelKey) {
+  chart.data.labels = rows.map(r => fmtLogTime(r.timestamp));
+  chart.data.datasets[0].data = rows.map(r => r[valueKey]);
+  chart.update();
+}
+
+// ---- website statistics ----------------------------------------------------
+async function renderWebStats() {
+  const sel = document.getElementById('webStatsTarget');
+  if (!webTargets.length) await loadWebTargets();
+  const keep = sel.value;
+  sel.innerHTML = webTargets.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
+  if (keep && webTargets.find(t => String(t.id) === keep)) sel.value = keep;
+
+  document.getElementById('webStatsEmpty').style.display = webTargets.length ? 'none' : 'block';
+  document.getElementById('webStatsBody').style.display = webTargets.length ? 'block' : 'none';
+  if (!webTargets.length) return;
+
+  const id = parseInt(sel.value, 10);
+  const t = webTargets.find(x => x.id === id);
+  document.getElementById('webStatsName').textContent = t ? t.name : '-';
+  document.getElementById('webStatsUrl').textContent = t ? t.url : '';
+
+  const [stats, hist] = await Promise.all([
+    apiFetch('/api/web-stats?target_id=' + id).then(r => r.json()),
+    apiFetch('/api/web-checks/history?target_id=' + id + '&limit=300').then(r => r.json()),
+  ]);
+  document.getElementById('webUptimeCards').innerHTML = uptimeCardsHtml(stats);
+  fillStatsChart(makeStatsChart('webLatencyChart', 'ms', '#5b8def'), hist, 'response_ms');
+  fillStatsChart(makeStatsChart('webUpChart', 'up', '#33c481'), hist, 'ok');
+}
+document.getElementById('webStatsTarget').addEventListener('change', renderWebStats);
+
+// ---- IP monitoring ---------------------------------------------------------
+let ipTargets = [];
+let editingIpId = null;
+
+const IP_CHECK_LABELS = {
+  reachable: 'unreachable', latency: 'slow',
+  ip_stable: 'IP changed', port_open: 'port closed',
+};
+
+async function loadIpTargets() {
+  const res = await apiFetch('/api/ip-targets');
+  ipTargets = await res.json();
+}
+
+async function refreshIpTargets() {
+  await loadIpTargets();
+  renderIpList();
+}
+
+function ipStateCell(t) {
+  const failing = Object.entries(t.health || {}).filter(([, v]) => v === false)
+    .map(([k]) => IP_CHECK_LABELS[k] || k);
+  if (!t.last_checked_at) return '<span style="color:var(--muted);">not checked yet</span>';
+  if (!failing.length) return '<span style="color:var(--ok);">OK</span>';
+  return `<span style="color:var(--bad);">${escapeHtml(failing.join(', '))}</span>`;
+}
+
+function renderIpList() {
+  document.getElementById('ipEmpty').style.display = ipTargets.length ? 'none' : 'block';
+  document.getElementById('ipListCard').style.display = ipTargets.length ? 'block' : 'none';
+  if (!ipTargets.length) return;
+
+  document.getElementById('ipTableBody').innerHTML = ipTargets.map((t, i) => {
+    const l = t.latest || {};
+    const check = t.method === 'tcp' ? `TCP ${t.port}` : 'ping';
+    return `<tr>
+      <td>${i + 1}</td>
+      <td style="font-weight:600; color:#fff;">${escapeHtml(t.name)}</td>
+      <td>${escapeHtml(t.address)}</td>
+      <td>${check}</td>
+      <td>${l.latency_ms != null ? Math.round(l.latency_ms) + ' ms' : '-'}</td>
+      <td>${escapeHtml(l.resolved_ip || '-')}</td>
+      <td>${ipStateCell(t)}</td>
+      <td style="text-align:right; white-space:nowrap;">
+        <button type="button" class="row-btn" data-ip-edit="${t.id}">Edit</button>
+        <button type="button" class="row-btn danger" data-ip-del="${t.id}">Delete</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  document.querySelectorAll('[data-ip-edit]').forEach(b => b.addEventListener('click', () => {
+    const t = ipTargets.find(x => x.id === parseInt(b.dataset.ipEdit, 10));
+    if (t) startEditIp(t);
+  }));
+  document.querySelectorAll('[data-ip-del]').forEach(b => b.addEventListener('click', async () => {
+    const t = ipTargets.find(x => x.id === parseInt(b.dataset.ipDel, 10));
+    if (!t || !confirm(`Stop monitoring "${t.name}" and delete its history?`)) return;
+    await apiFetch('/api/ip-targets/' + t.id, { method: 'DELETE' });
+    await refreshIpTargets();
+  }));
+}
+
+function syncIpPortField() {
+  document.getElementById('ipPortField').style.display =
+    document.getElementById('ipMethod').value === 'tcp' ? 'block' : 'none';
+}
+document.getElementById('ipMethod').addEventListener('change', syncIpPortField);
+syncIpPortField();
+
+function startEditIp(t) {
+  editingIpId = t.id;
+  document.getElementById('ipFormTitle').textContent = 'Edit Target';
+  document.getElementById('ipName').value = t.name;
+  document.getElementById('ipAddress').value = t.address;
+  document.getElementById('ipMethod').value = t.method;
+  document.getElementById('ipPort').value = t.port ?? '';
+  document.getElementById('ipSlowMs').value = t.slow_ms ?? '';
+  document.getElementById('ipFormSubmit').textContent = 'Save Changes';
+  document.getElementById('ipFormCancel').style.display = 'inline-block';
+  document.getElementById('ipMsg').textContent = '';
+  syncIpPortField();
+  showSubTab(document.getElementById('view-ip'), 'ip-add');
+}
+
+function cancelEditIp() {
+  editingIpId = null;
+  document.getElementById('ipFormTitle').textContent = 'Add IP Address';
+  document.getElementById('addIpForm').reset();
+  document.getElementById('ipFormSubmit').textContent = 'Add Target';
+  document.getElementById('ipFormCancel').style.display = 'none';
+  document.getElementById('ipMsg').textContent = '';
+  syncIpPortField();
+}
+document.getElementById('ipFormCancel').addEventListener('click', cancelEditIp);
+
+document.getElementById('addIpForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('ipMsg');
+  msg.className = 'form-msg';
+  const body = {
+    name: document.getElementById('ipName').value.trim(),
+    address: document.getElementById('ipAddress').value.trim(),
+    method: document.getElementById('ipMethod').value,
+    port: document.getElementById('ipPort').value,
+    slow_ms: document.getElementById('ipSlowMs').value,
+  };
+  const res = editingIpId
+    ? await apiFetch('/api/ip-targets/' + editingIpId, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    : await apiFetch('/api/ip-targets', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    cancelEditIp();
+    await refreshIpTargets();
+    showSubTab(document.getElementById('view-ip'), 'ip-list');
+  } else {
+    msg.textContent = data.error || 'Failed to save target.';
+    msg.className = 'form-msg error';
+  }
+});
+
+async function renderIpStats() {
+  const sel = document.getElementById('ipStatsTarget');
+  if (!ipTargets.length) await loadIpTargets();
+  const keep = sel.value;
+  sel.innerHTML = ipTargets.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
+  if (keep && ipTargets.find(t => String(t.id) === keep)) sel.value = keep;
+
+  document.getElementById('ipStatsEmpty').style.display = ipTargets.length ? 'none' : 'block';
+  document.getElementById('ipStatsBody').style.display = ipTargets.length ? 'block' : 'none';
+  if (!ipTargets.length) return;
+
+  const id = parseInt(sel.value, 10);
+  const t = ipTargets.find(x => x.id === id);
+  document.getElementById('ipStatsName').textContent = t ? t.name : '-';
+  document.getElementById('ipStatsAddr').textContent =
+    t ? `${t.address} · ${t.method === 'tcp' ? 'TCP port ' + t.port : 'ICMP ping'}` : '';
+
+  const [stats, hist] = await Promise.all([
+    apiFetch('/api/ip-stats?target_id=' + id).then(r => r.json()),
+    apiFetch('/api/ip-checks/history?target_id=' + id + '&limit=300').then(r => r.json()),
+  ]);
+  document.getElementById('ipUptimeCards').innerHTML = uptimeCardsHtml(stats);
+  fillStatsChart(makeStatsChart('ipLatencyChart', 'ms', '#e0a72e'), hist, 'latency_ms');
+  fillStatsChart(makeStatsChart('ipUpChart', 'up', '#33c481'), hist, 'ok');
+}
+document.getElementById('ipStatsTarget').addEventListener('change', renderIpStats);
+
 
 // ---------------------------------------------------------------------------
 // Website monitoring

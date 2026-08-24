@@ -435,6 +435,113 @@ def cmd_web_import(args):
 
 
 # ---------------------------------------------------------------------------
+# ip (host reachability)
+# ---------------------------------------------------------------------------
+def resolve_ip_target(ref):
+    targets = app.get_ip_targets()
+    if ref.isdigit():
+        m = next((t for t in targets if t['id'] == int(ref)), None)
+        if m:
+            return m
+    matches = [t for t in targets if t['name'].lower() == ref.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die(f"several targets are named {ref!r}; use the numeric id instead")
+    die(f"no IP target matching {ref!r} (try: vpsmon ip list)")
+
+
+def cmd_ip_list(args):
+    rows = []
+    for t in app.get_ip_targets():
+        l = app.get_ip_latest(t['id']) or {}
+        failing = [app.IP_CHECK_DEFS[k] for k, v in (t.get('health') or {}).items() if v is False]
+        rows.append([t['id'], t['name'], t['address'],
+                     f"TCP {t['port']}" if t['method'] == 'tcp' else 'ping',
+                     f"{l['latency_ms']:.0f}" if l.get('latency_ms') is not None else '-',
+                     fmt(l.get('resolved_ip')),
+                     ', '.join(failing) or ('ok' if t.get('last_checked_at') else '-')])
+    table(["ID", "NAME", "ADDRESS", "CHECK", "MS", "RESOLVED", "STATE"], rows)
+
+
+def cmd_ip_add(args):
+    if args.method == 'tcp' and not args.port:
+        die("--port is required for a TCP check")
+    conn = app.db()
+    try:
+        cur = conn.execute(
+            "INSERT INTO ip_targets (name, address, method, port, slow_ms, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?)",
+            (args.name, args.address, args.method, args.port, args.slow_ms, app.utcnow().isoformat())
+        )
+        conn.commit(); new_id = cur.lastrowid
+    except sqlite3.IntegrityError:
+        die(f"{args.address} is already being monitored")
+    finally:
+        conn.close()
+    audit("ip.create", args.name, args.address)
+    ok(f"Added IP target {new_id}: {args.name} -> {args.address}")
+
+
+def cmd_ip_remove(args):
+    t = resolve_ip_target(args.target)
+    if not args.yes:
+        if input(f"Delete {t['name']!r} and its history? [y/N] ").strip().lower() not in ('y', 'yes'):
+            ok("Cancelled."); return
+    conn = app.db()
+    conn.execute("DELETE FROM ip_targets WHERE id = ?", (t['id'],))
+    conn.execute("DELETE FROM ip_checks WHERE target_id = ?", (t['id'],))
+    conn.execute("DELETE FROM alert_subscriptions WHERE instance_id = ? AND monitor_type = 'ip'", (t['id'],))
+    conn.commit(); conn.close()
+    audit("ip.delete", t['name'])
+    ok(f"Deleted IP target {t['id']} ({t['name']}).")
+
+
+def cmd_ip_check(args):
+    targets = [resolve_ip_target(args.target)] if args.target else app.get_ip_targets()
+    rows = []
+    for t in targets:
+        r = app.check_ip_target(t)
+        app.save_ip_check(r)
+        conn = app.db()
+        conn.execute("UPDATE ip_targets SET last_status=?, last_error=?, last_checked_at=?, last_ip=? WHERE id=?",
+                     ('ok' if r['ok'] else 'error', r['error'], r['timestamp'], r['resolved_ip'], t['id']))
+        conn.commit(); conn.close()
+        rows.append([t['name'], 'UP' if r['ok'] else 'DOWN',
+                     f"{r['latency_ms']:.0f}" if r['latency_ms'] is not None else '-',
+                     fmt(r['resolved_ip']), (r['error'] or '')[:44]])
+    table(["NAME", "RESULT", "MS", "RESOLVED", "ERROR"], rows)
+
+
+def cmd_ip_stats(args):
+    t = resolve_ip_target(args.target)
+    st = app.get_ip_stats(t['id'], args.hours * 3600)
+    ok(f"{t['name']} ({t['address']}) over the last {args.hours}h:")
+    table(["METRIC", "VALUE"], [
+        ["checks", st['checks']],
+        ["uptime", f"{st['uptime_pct']}%" if st['uptime_pct'] is not None else '-'],
+        ["failed", st['down']],
+        ["latency p50", fmt(st['p50_ms'])],
+        ["latency p95", fmt(st['p95_ms'])],
+        ["latency max", fmt(st['max_ms'])],
+    ])
+
+
+def cmd_web_stats(args):
+    t = resolve_web(args.target)
+    st = app.get_web_stats(t['id'], args.hours * 3600)
+    ok(f"{t['name']} ({t['url']}) over the last {args.hours}h:")
+    table(["METRIC", "VALUE"], [
+        ["checks", st['checks']],
+        ["uptime", f"{st['uptime_pct']}%" if st['uptime_pct'] is not None else '-'],
+        ["failed", st['down']],
+        ["response p50", fmt(st['p50_ms'])],
+        ["response p95", fmt(st['p95_ms'])],
+        ["response max", fmt(st['max_ms'])],
+    ])
+
+
+# ---------------------------------------------------------------------------
 # user
 # ---------------------------------------------------------------------------
 def prompt_password(label="Password"):
@@ -688,6 +795,39 @@ def build_parser():
     p = web_sub.add_parser("import", help="bulk add from a CSV (name/company + url/domain columns)")
     p.add_argument("file")
     p.set_defaults(func=cmd_web_import)
+
+    p = web_sub.add_parser("stats", help="uptime and response-time summary")
+    p.add_argument("target")
+    p.add_argument("--hours", type=int, default=24)
+    p.set_defaults(func=cmd_web_stats)
+
+    # --- ip ---
+    ipp = sub.add_parser("ip", help="monitor hosts by IP or hostname (ping / TCP port)")
+    ip_sub = ipp.add_subparsers(dest="sub", required=True)
+    ip_sub.add_parser("list", help="list monitored hosts").set_defaults(func=cmd_ip_list)
+
+    p = ip_sub.add_parser("add", help="add a host")
+    p.add_argument("--name", required=True)
+    p.add_argument("--address", required=True, help="IP address or hostname")
+    p.add_argument("--method", choices=("tcp", "ping"), default="tcp",
+                   help="tcp proves a service is listening; ping only proves ICMP is answered")
+    p.add_argument("--port", type=int, help="required when --method tcp")
+    p.add_argument("--slow-ms", dest="slow_ms", type=int, help="flag as slow above this latency")
+    p.set_defaults(func=cmd_ip_add)
+
+    p = ip_sub.add_parser("remove", help="stop monitoring a host")
+    p.add_argument("target")
+    p.add_argument("-y", "--yes", action="store_true")
+    p.set_defaults(func=cmd_ip_remove)
+
+    p = ip_sub.add_parser("check", help="run a check now rather than waiting")
+    p.add_argument("target", nargs="?", help="name or id (default: all)")
+    p.set_defaults(func=cmd_ip_check)
+
+    p = ip_sub.add_parser("stats", help="uptime and latency summary")
+    p.add_argument("target")
+    p.add_argument("--hours", type=int, default=24)
+    p.set_defaults(func=cmd_ip_stats)
 
     # --- user ---
     us = sub.add_parser("user", help="manage dashboard accounts")

@@ -32,6 +32,7 @@ def main():
 
     threading.Thread(target=app.heartbeat_loop, daemon=True).start()
     threading.Thread(target=app.web_check_loop, daemon=True).start()
+    threading.Thread(target=app.ip_check_loop, daemon=True).start()
 
     # Runs forever in the foreground so systemd can supervise it directly.
     app.scrape_loop()
