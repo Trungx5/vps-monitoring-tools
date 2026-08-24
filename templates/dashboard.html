@@ -45,7 +45,7 @@
   .hamburger-btn:hover { border-color: var(--accent); }
   .topbar-titles h1 { font-size: 18px; font-weight: 600; margin: 0; }
   .topbar-titles .subtitle { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .topbar-instance-select {
+  .refresh-btn {
     margin-left: auto;
     background: var(--card);
     border: 1px solid var(--border);
@@ -56,7 +56,20 @@
     max-width: 220px;
     flex-shrink: 0;
   }
-  .topbar-instance-select:focus { outline: none; border-color: var(--accent); }
+  .refresh-btn { cursor: pointer; }
+  .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .refresh-btn.busy { opacity: 0.55; pointer-events: none; }
+
+  .bulk-box { margin-top: 22px; border-top: 1px solid var(--border); padding-top: 18px; }
+  .bulk-box textarea {
+    width: 100%; min-height: 130px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; resize: vertical;
+  }
+  .bulk-box textarea:focus { outline: none; border-color: var(--accent); }
+  .bulk-hint { font-size: 11.5px; color: var(--muted); margin: 6px 0 10px; line-height: 1.5; }
+  .bulk-result { font-size: 12px; margin-top: 10px; max-height: 180px; overflow-y: auto; }
+  .bulk-result div { padding: 2px 0; }
   .status-dot {
     display: inline-block;
     width: 8px; height: 8px;
@@ -420,7 +433,7 @@
   <div class="topbar-titles">
     <h1 id="sectionTitle"><span class="status-dot" id="statusDot"></span>Main Monitor</h1>
   </div>
-  <select id="topbarInstanceSelect" class="topbar-instance-select" title="Switch target"></select>
+  <button id="refreshBtn" class="refresh-btn" title="Reload the data on this screen">Refresh</button>
 </div>
 
 <div class="content">
@@ -450,6 +463,25 @@
     <div id="mainOverview">
       <div id="overviewEmpty" class="empty-state" style="display:none;">Nothing to show yet.</div>
       <div class="overview-grid" id="overviewGrid"></div>
+    </div>
+
+    <!-- one specific web or IP target selected -->
+    <div id="mainDetailOther" style="display:none;">
+      <div class="target-header">
+        <div class="target-name" id="otherName">&mdash;</div>
+        <div class="target-info" id="otherInfo"></div>
+      </div>
+      <div class="grid" id="otherUptimeCards"></div>
+      <div class="charts-grid">
+        <div class="chart-card">
+          <div class="chart-title" id="otherLatencyTitle">Response time (ms)</div>
+          <canvas id="otherLatencyChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Up / down (1 = up)</div>
+          <canvas id="otherUpChart"></canvas>
+        </div>
+      </div>
     </div>
 
     <!-- one specific target selected -->
@@ -586,7 +618,16 @@
           </form>
         </div>
 
-        <h2 class="section-title">Existing Instances</h2>
+    
+      <div class="bulk-box">
+        <h3 style="font-size:14px; margin:0 0 6px;">Add several at once</h3>
+        <div class="bulk-hint">One per line: <code>Name, http://ip:9100</code>. The <code>/metrics</code> path is added for you. Lines that already exist are skipped.</div>
+        <textarea id="bulkVpsInput" placeholder="Web 1, http://10.0.0.5:9100&#10;DB 1, http://10.0.0.6:9100"></textarea>
+        <button type="button" class="btn" id="bulkVpsBtn" style="margin-top:10px;">Add All</button>
+        <div class="bulk-result" id="bulkVpsResult"></div>
+      </div>
+
+    <h2 class="section-title">Existing Instances</h2>
         <div class="panel-card" id="manageInstList" style="max-width:560px;">
           <div class="empty-state" id="manageInstEmpty">No instances yet.</div>
         </div>
@@ -671,6 +712,13 @@
           <button type="button" class="btn" id="webFormCancel" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
           <div class="form-msg" id="webMsg"></div>
         </form>
+      </div>
+      <div class="bulk-box">
+        <h3 style="font-size:14px; margin:0 0 6px;">Add several at once</h3>
+        <div class="bulk-hint">One per line: <code>Name, https://example.com</code> &mdash; or just a URL, and the hostname becomes the name. <code>https://</code> is assumed.</div>
+        <textarea id="bulkWebInput" placeholder="AEON Vietnam, https://aeon.com.vn&#10;https://muji.com.vn"></textarea>
+        <button type="button" class="btn" id="bulkWebBtn" style="margin-top:10px;">Add All</button>
+        <div class="bulk-result" id="bulkWebResult"></div>
       </div>
     </div>
 
@@ -766,6 +814,13 @@
           <button type="button" class="btn" id="ipFormCancel" style="display:none; background:var(--border); color:var(--text);">Cancel</button>
           <div class="form-msg" id="ipMsg"></div>
         </form>
+      </div>
+      <div class="bulk-box">
+        <h3 style="font-size:14px; margin:0 0 6px;">Add several at once</h3>
+        <div class="bulk-hint">One per line: <code>Name, address, tcp, 443</code> or <code>Name, address, ping</code>. With only a name and address, a TCP check on port 443 is assumed.</div>
+        <textarea id="bulkIpInput" placeholder="Edge router, 10.0.0.1, tcp, 22&#10;Google DNS, 8.8.8.8, ping"></textarea>
+        <button type="button" class="btn" id="bulkIpBtn" style="margin-top:10px;">Add All</button>
+        <div class="bulk-result" id="bulkIpResult"></div>
       </div>
     </div>
 
@@ -1306,21 +1361,9 @@ async function loadInstances() {
 }
 
 function updateTopbar() {
-  const switcher = document.getElementById('topbarInstanceSelect');
-  if (!instances.length) {
-    switcher.innerHTML = '<option value="">No instances</option>';
-    switcher.disabled = true;
-  } else {
-    switcher.disabled = false;
-    switcher.innerHTML = instances.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
-    if (currentInstanceId) switcher.value = currentInstanceId;
-  }
+  // The target is chosen inside Main Monitor now, so the top bar carries only
+  // the section name and the refresh control.
 }
-
-document.getElementById('topbarInstanceSelect').addEventListener('change', (e) => {
-  const id = parseInt(e.target.value, 10);
-  if (id) selectInstance(id);
-});
 
 function selectInstance(id) {
   currentInstanceId = id;
@@ -1346,37 +1389,53 @@ function selectInstance(id) {
 let mainType = 'vps';
 let mainTargetId = null;   // null = show the "all" overview
 
-function renderMainMonitor() {
+async function renderMainMonitor() {
   const typeSel = document.getElementById('mainTypeSelect');
   const targetSel = document.getElementById('mainTargetSelect');
   const unavailable = document.getElementById('mainUnavailable');
   const overview = document.getElementById('mainOverview');
   const detail = document.getElementById('mainDetail');
+  const other = document.getElementById('mainDetailOther');
 
   mainType = typeSel.value;
-
-  if (mainType !== 'vps') {
-    const label = mainType === 'web' ? 'Website' : 'IP address';
-    targetSel.innerHTML = '<option value="">All &mdash; overall status</option>';
-    targetSel.disabled = true;
-    unavailable.style.display = 'block';
-    unavailable.innerHTML = `<div style="font-size:15px; color:var(--text); margin-bottom:6px;">`
-      + `${label} monitoring is not wired up yet</div>`
-      + `The section exists so the layout is settled, but nothing is being checked yet.`;
-    overview.style.display = 'none';
-    detail.style.display = 'none';
-    return;
-  }
-
-  targetSel.disabled = false;
   unavailable.style.display = 'none';
+  targetSel.disabled = false;
+
+  // Whichever list backs the chosen monitor type.
+  let list;
+  if (mainType === 'web') {
+    if (!webTargets.length) await loadWebTargets();
+    list = webTargets;
+  } else if (mainType === 'ip') {
+    if (!ipTargets.length) await loadIpTargets();
+    list = ipTargets;
+  } else {
+    list = instances;
+  }
 
   const keep = mainTargetId;
   targetSel.innerHTML = '<option value="">All &mdash; overall status</option>'
-    + instances.map(i => `<option value="${i.id}">${escapeHtml(i.name)}</option>`).join('');
-  targetSel.value = keep && instances.find(i => i.id === keep) ? String(keep) : '';
+    + list.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join('');
+  targetSel.value = keep && list.find(t => t.id === keep) ? String(keep) : '';
   mainTargetId = targetSel.value ? parseInt(targetSel.value, 10) : null;
 
+  // --- web / ip ---
+  if (mainType !== 'vps') {
+    detail.style.display = 'none';
+    if (mainTargetId === null) {
+      other.style.display = 'none';
+      overview.style.display = 'block';
+      await renderOtherOverview(mainType);
+    } else {
+      overview.style.display = 'none';
+      other.style.display = 'block';
+      await renderOtherDetail(mainType, mainTargetId);
+    }
+    return;
+  }
+
+  // --- vps ---
+  other.style.display = 'none';
   if (mainTargetId === null) {
     overview.style.display = 'block';
     detail.style.display = 'none';
@@ -1387,7 +1446,6 @@ function renderMainMonitor() {
     if (mainTargetId !== currentInstanceId) {
       currentInstanceId = mainTargetId;
       localStorage.setItem('vpsmon_instance_id', mainTargetId);
-      updateTopbar();
       resetCharts();
       loadThresholds();
       refreshHistory();
@@ -2328,6 +2386,195 @@ async function renderIpStats() {
   fillStatsChart(makeStatsChart('ipUpChart', 'up', '#33c481'), hist, 'ok');
 }
 document.getElementById('ipStatsTarget').addEventListener('change', renderIpStats);
+
+// ---------------------------------------------------------------------------
+// Refresh button - reloads whatever the current screen is showing.
+// ---------------------------------------------------------------------------
+async function refreshCurrentView() {
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('busy');
+  const original = btn.textContent;
+  btn.textContent = 'Refreshing…';
+  try {
+    await loadInstances();
+    const view = document.querySelector('.view.active');
+    if (view && view.id === 'view-main') {
+      await loadOverviewMetrics();
+      await renderMainMonitor();
+    }
+    const sub = view && view.querySelector('.subview.active');
+    if (sub) {
+      const loader = SUBTAB_LOADERS[sub.id.replace(/^sub-/, '')];
+      if (loader) await loader();
+    }
+    if (currentInstanceId) { refreshLatest(); refreshHistory(); }
+  } finally {
+    btn.textContent = original;
+    btn.classList.remove('busy');
+  }
+}
+document.getElementById('refreshBtn').addEventListener('click', refreshCurrentView);
+
+// ---------------------------------------------------------------------------
+// Bulk add. Each line is sent through the same endpoint the single-item form
+// uses, so validation and duplicate handling stay in one place.
+// ---------------------------------------------------------------------------
+function splitLine(line) {
+  return line.split(',').map(x => x.trim()).filter(x => x.length);
+}
+
+async function bulkAdd(inputId, resultId, endpoint, mapper, after) {
+  const box = document.getElementById(inputId);
+  const out = document.getElementById(resultId);
+  const lines = box.value.split('\n').map(l => l.trim()).filter(l => l);
+  if (!lines.length) {
+    out.innerHTML = '<div style="color:var(--muted);">Nothing to add.</div>';
+    return;
+  }
+  out.innerHTML = '<div style="color:var(--muted);">Working…</div>';
+
+  let added = 0;
+  const messages = [];
+  for (const line of lines) {
+    let payload;
+    try {
+      payload = mapper(splitLine(line), line);
+    } catch (err) {
+      messages.push(`<div style="color:var(--bad);">${escapeHtml(line)} — ${escapeHtml(err.message)}</div>`);
+      continue;
+    }
+    if (!payload) {
+      messages.push(`<div style="color:var(--bad);">${escapeHtml(line)} — could not parse</div>`);
+      continue;
+    }
+    const res = await apiFetch(endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      added++;
+      messages.push(`<div style="color:var(--ok);">${escapeHtml(payload.name)} — added</div>`);
+    } else {
+      messages.push(`<div style="color:var(--bad);">${escapeHtml(payload.name || line)} — ${escapeHtml(data.error || 'failed')}</div>`);
+    }
+  }
+  out.innerHTML = `<div style="margin-bottom:6px;">${added} of ${lines.length} added.</div>` + messages.join('');
+  if (added) { box.value = ''; if (after) await after(); }
+}
+
+document.getElementById('bulkVpsBtn').addEventListener('click', () => bulkAdd(
+  'bulkVpsInput', 'bulkVpsResult', '/api/instances',
+  (parts) => {
+    if (parts.length < 2) throw new Error('needs "Name, URL"');
+    return { name: parts[0], target_url: parts[1] };
+  },
+  async () => { await loadInstances(); renderManageList(); }
+));
+
+document.getElementById('bulkWebBtn').addEventListener('click', () => bulkAdd(
+  'bulkWebInput', 'bulkWebResult', '/api/web-targets',
+  (parts) => {
+    let name, url;
+    if (parts.length === 1) {
+      url = parts[0];
+      name = url.replace(/^https?:\/\//i, '').split('/')[0];
+    } else { name = parts[0]; url = parts[1]; }
+    return { name, url };
+  },
+  refreshWebTargets
+));
+
+document.getElementById('bulkIpBtn').addEventListener('click', () => bulkAdd(
+  'bulkIpInput', 'bulkIpResult', '/api/ip-targets',
+  (parts) => {
+    if (parts.length < 2) throw new Error('needs "Name, address"');
+    const method = (parts[2] || 'tcp').toLowerCase();
+    if (!['tcp', 'ping'].includes(method)) throw new Error('method must be tcp or ping');
+    const payload = { name: parts[0], address: parts[1], method };
+    if (method === 'tcp') payload.port = parts[3] || 443;
+    return payload;
+  },
+  refreshIpTargets
+));
+
+// ---------------------------------------------------------------------------
+// Main Monitor support for web and IP targets
+// ---------------------------------------------------------------------------
+function otherOverviewCard(t, kind) {
+  const l = t.latest || {};
+  const sev = (t.severity && t.severity.overall) || null;
+  const down = t.last_status === 'error';
+  const cls = down || sev === 'critical' ? 'critical' : (sev === 'warn' ? 'warn' : '');
+  const failing = Object.entries(t.health || {}).filter(([, v]) => v === false).length;
+
+  const sub = kind === 'web' ? t.url
+            : `${t.address} · ${t.method === 'tcp' ? 'TCP ' + t.port : 'ping'}`;
+  const latency = kind === 'web' ? l.response_ms : l.latency_ms;
+  const metrics = kind === 'web'
+    ? `<div class="overview-metric"><div class="k">Status</div><div class="v">${l.status_code ?? '--'}</div></div>
+       <div class="overview-metric"><div class="k">Time</div><div class="v">${latency != null ? Math.round(latency) + ' ms' : '--'}</div></div>
+       <div class="overview-metric"><div class="k">Cert</div><div class="v">${l.cert_days != null ? Math.round(l.cert_days) + 'd' : '--'}</div></div>`
+    : `<div class="overview-metric"><div class="k">Latency</div><div class="v">${latency != null ? Math.round(latency) + ' ms' : '--'}</div></div>
+       <div class="overview-metric"><div class="k">Resolved</div><div class="v" style="font-size:13px;">${escapeHtml(l.resolved_ip || '--')}</div></div>`;
+
+  let note;
+  if (!t.last_checked_at) note = '<div class="overview-note" style="color:var(--muted);">Not checked yet</div>';
+  else if (down || failing) note = `<div class="overview-note" style="color:var(--bad);">${escapeHtml(t.last_error || (failing + ' check(s) failing'))}</div>`.slice(0, 400);
+  else note = '<div class="overview-note" style="color:var(--ok);">All checks passing</div>';
+
+  return `<div class="overview-card ${cls}" data-other-id="${t.id}">
+    <div class="overview-name">${escapeHtml(t.name)}</div>
+    <div class="overview-sub">${escapeHtml(sub)}</div>
+    <div class="overview-metrics">${metrics}</div>
+    ${note}
+  </div>`;
+}
+
+async function renderOtherOverview(kind) {
+  const list = kind === 'web' ? webTargets : ipTargets;
+  const grid = document.getElementById('overviewGrid');
+  const empty = document.getElementById('overviewEmpty');
+  if (!list.length) {
+    empty.style.display = 'block';
+    empty.innerHTML = kind === 'web'
+      ? 'No websites yet. Add one under <strong>Web Monitor &rarr; Add Website</strong>.'
+      : 'Nothing yet. Add one under <strong>IP Monitor &rarr; Add IP Address</strong>.';
+    grid.innerHTML = '';
+    return;
+  }
+  empty.style.display = 'none';
+  grid.innerHTML = list.map(t => otherOverviewCard(t, kind)).join('');
+  grid.querySelectorAll('[data-other-id]').forEach(card => {
+    card.addEventListener('click', () => {
+      mainTargetId = parseInt(card.dataset.otherId, 10);
+      document.getElementById('mainTargetSelect').value = String(mainTargetId);
+      renderMainMonitor();
+    });
+  });
+}
+
+async function renderOtherDetail(kind, id) {
+  const list = kind === 'web' ? webTargets : ipTargets;
+  const t = list.find(x => x.id === id);
+  if (!t) return;
+  document.getElementById('otherName').textContent = t.name;
+  document.getElementById('otherInfo').textContent = kind === 'web'
+    ? `${t.url} · checked every 60s`
+    : `${t.address} · ${t.method === 'tcp' ? 'TCP port ' + t.port : 'ICMP ping'} · checked every 60s`;
+  document.getElementById('otherLatencyTitle').textContent =
+    kind === 'web' ? 'Response time (ms)' : 'Latency (ms)';
+
+  const base = kind === 'web' ? '/api/web' : '/api/ip';
+  const [stats, hist] = await Promise.all([
+    apiFetch(`${base}-stats?target_id=${id}`).then(r => r.json()),
+    apiFetch(`${base}-checks/history?target_id=${id}&limit=300`).then(r => r.json()),
+  ]);
+  document.getElementById('otherUptimeCards').innerHTML = uptimeCardsHtml(stats);
+  fillStatsChart(makeStatsChart('otherLatencyChart', 'ms', '#5b8def'), hist,
+                 kind === 'web' ? 'response_ms' : 'latency_ms');
+  fillStatsChart(makeStatsChart('otherUpChart', 'up', '#33c481'), hist, 'ok');
+}
+
 
 
 // ---------------------------------------------------------------------------

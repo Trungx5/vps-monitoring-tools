@@ -52,8 +52,9 @@ from werkzeug.security import check_password_hash, generate_password_hash
 # app runs. After that, instances live in the `instances` table and are
 # managed from the dashboard's sidebar.
 DEFAULT_TARGET_URL = os.environ.get("DEFAULT_TARGET_URL", "")
-SCRAPE_INTERVAL_SECONDS = 10
-HEARTBEAT_INTERVAL_SECONDS = 30
+# Tunable so a small device can trade resolution for far fewer disk writes.
+SCRAPE_INTERVAL_SECONDS = int(os.environ.get("SCRAPE_INTERVAL_SECONDS", "10"))
+HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "30"))
 # Websites are checked from the outside and are far less volatile than a
 # server's CPU, so they get a slower cadence - and hammering someone else's
 # site every 10 seconds would be rude at best.
@@ -62,6 +63,9 @@ WEB_CHECK_TIMEOUT_SECONDS = 15
 WEB_CHECK_RETENTION_DAYS = 30
 EVENT_LOG_RETENTION_DAYS = 3
 AUDIT_LOG_RETENTION_DAYS = 90
+# The metrics table used to grow without bound. On a small device that fills
+# the disk (and wears the SD card) long before anything else does.
+METRICS_RETENTION_DAYS = int(os.environ.get("METRICS_RETENTION_DAYS", "14"))
 DB_PATH = os.environ.get("DB_PATH", "metrics.db")
 LOG_FILE_PATH = os.environ.get("LOG_FILE_PATH", "vps_monitor.log")
 SQLITE_TIMEOUT_SECONDS = 30
@@ -546,6 +550,9 @@ def _init_db_once():
     # WAL lets the web workers keep reading while the scraper writes, instead
     # of the two blocking each other on every sample.
     conn.execute("PRAGMA journal_mode = WAL")
+    # With WAL, NORMAL only loses the very last transactions on a hard power
+    # cut instead of fsync-ing every write - a large win on SD-card storage.
+    conn.execute("PRAGMA synchronous = NORMAL")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS instances (
@@ -896,7 +903,7 @@ def get_instances(include_secrets=False):
         latest = get_latest(inst["id"])
         thresholds = get_thresholds(inst["id"])
         inst["severity"] = evaluate_severity(latest, thresholds)
-        inst["health"] = evaluate_health(inst, get_history(inst["id"], limit=30))
+        inst["health"] = evaluate_health(inst, get_history_for_health(inst["id"]))
     return instances
 
 
@@ -977,6 +984,30 @@ def get_history_range(instance_id, seconds, max_points=300):
     if len(rows) <= max_points:
         return rows
     return _downsample_history(rows, max_points)
+
+
+HEALTH_COLUMNS = ("timestamp, cpu_count, load1, swap_percent, fs_readonly, "
+                  "net_ifaces_down, boot_time, net_rx_bps, net_tx_bps")
+
+
+def get_history_for_health(instance_id, limit=30):
+    """Just the columns evaluate_health() reads. Called for every instance on
+    every scrape and every dashboard poll, so it is worth keeping narrow."""
+    conn = db()
+    rows = conn.execute(
+        f"SELECT {HEALTH_COLUMNS} FROM metrics WHERE instance_id = ? ORDER BY id DESC LIMIT ?",
+        (instance_id, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in reversed(rows)]
+
+
+def trim_metrics():
+    cutoff = (utcnow() - timedelta(days=METRICS_RETENTION_DAYS)).isoformat()
+    conn = db()
+    conn.execute("DELETE FROM metrics WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
 
 
 def get_thresholds(instance_id):
@@ -2066,7 +2097,7 @@ def scrape_loop():
                     subscriptions = get_subscriptions(iid)
                     maybe_alert(inst, metrics, thresholds, subscriptions)
                     inst["last_status"] = "ok"
-                    health = evaluate_health(inst, get_history(iid, limit=30))
+                    health = evaluate_health(inst, get_history_for_health(iid))
                     maybe_alert_health(inst, health, subscriptions)
                 else:
                     set_instance_status(iid, "pending")
@@ -2114,6 +2145,7 @@ def heartbeat_loop():
             log_event(level, "heartbeat", message, iid, inst["name"])
         trim_event_log()
         trim_audit_log()
+        trim_metrics()
 
 
 # ---------------------------------------------------------------------------

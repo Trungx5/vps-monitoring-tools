@@ -14,7 +14,11 @@ bind = os.environ.get("BIND", "127.0.0.1:5000")
 
 # Modest worker count: this app is I/O-light and SQLite is the shared
 # bottleneck, so a large pool buys nothing and only increases write contention.
-workers = int(os.environ.get("WEB_WORKERS", min(4, multiprocessing.cpu_count() * 2 + 1)))
+# On a single-board computer the memory cost of each worker matters more than
+# concurrency, so cap harder when there are few cores.
+_cores = multiprocessing.cpu_count()
+_default_workers = 2 if _cores <= 2 else min(4, _cores * 2 + 1)
+workers = int(os.environ.get("WEB_WORKERS", _default_workers))
 threads = int(os.environ.get("WEB_THREADS", "2"))
 worker_class = "gthread"
 
